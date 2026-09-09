@@ -1,0 +1,276 @@
+# WATCH.md — read-only watch on a spanweave WORKPLAN.md builder run
+
+`watch_run.sh` observes the builder Claude Code session executing a run of
+`WORKPLAN.md` on branch `audit-fixes` in `~/git/spanweave`. It reports; it never
+intervenes. `status_check.sh` is the same knowledge as a one-shot report.
+`README.md` has the invocations; this file is the behaviour.
+
+## What it is allowed to do
+
+Reads only:
+
+- `git fetch --quiet origin audit-fixes`, `git log`, `git rev-parse`,
+  `git --no-optional-locks status --short`, `git stash list`, `git show --stat`
+- file mtimes (`WORKPLAN.md`, `.git/index`, transcripts, sub-agent transcripts)
+- `pgrep -af claude`
+- tails of the builder's transcript JSONL
+
+It **never** writes to the repo, never commits, never checks out, never runs
+`make`, `uv`, or `pytest`. Its only writes are under `state/`;
+`status_check.sh` writes nothing at all.
+
+`git fetch` and `--no-optional-locks` are deliberate: fetch updates only the
+remote-tracking ref, and `--no-optional-locks` stops `git status` from
+rewriting `.git/index` — which would otherwise make the watcher's own read look
+like builder activity and permanently suppress the `stall` trigger. For the same
+reason `.git/index` is stat'd *before* any git command runs in a poll.
+
+## Running it
+
+```bash
+./watch_run.sh --run 2 --batches "A5 A6 ..."          # poll every 5 min, at most 9 min, then exit
+./watch_run.sh --once --run 2 --batches "A5 A6 ..."   # a single poll
+./watch_monitor.sh --run 2 --batches "A5 A6 ..."      # arming path under the Monitor tool
+./watch_loop.sh --run 2 --batches "A5 A6 ..."         # arming path in a plain terminal
+```
+
+Flags on all four: `--run N`, `--batches "<list>"`, `--base SHA`,
+`--branch NAME`, `--pids "P P P"`; `watch_run.sh` also takes `--once`.
+Environment overrides (all optional, flags set the same variables):
+`SPANWEAVE_REPO`, `SPANWEAVE_TDIR`, `SPANWEAVE_PINNED`, `SPANWEAVE_SELF`,
+`SPANWEAVE_BASE`, `SPANWEAVE_BRANCH`, `SPANWEAVE_RUN`, `SPANWEAVE_BATCHES`,
+`SPANWEAVE_PIDS`, `SPANWEAVE_STATE_DIR`, `POLL_SECONDS`, `BUDGET_SECONDS`.
+
+Each poll prints a one-line banner naming the transcript it is watching, HEAD,
+`origin/audit-fixes`, the liveness timestamp and its age, the last observed
+`pendingBackgroundAgentCount`, the batches still active, and any currently
+suppressed trigger. Banners are appended to `state/poll.log`.
+
+## Per-trigger policy
+
+Two triggers are **terminal** — they stop the watch and set the exit code.
+The other three are **report-and-continue**: they print their evidence block
+and the loop goes on polling, so a single tripwire hit or a pause for a
+question no longer costs the watch.
+
+| trigger | terminal? | repeat policy |
+|---|---|---|
+| **finished** | yes, exit `10` | — |
+| **builder gone** | yes, exit `13` | — |
+| **tripwire** | no | per commit sha, once ever; `state/watch_state.json` keeps `reported_commits` |
+| **waiting on user** | no | once, then suppressed until liveness moves |
+| **stall** | no | once, then suppressed for a further 40 min without movement |
+| watcher error | yes, exit `2` | — |
+
+A suppressed `waiting on user` or `stall` is lifted the moment any watched
+signal moves, and the lift is itself reported as one line:
+
+```
+RESUMED after waiting on user (quiet 23.4 min): liveness 02:10:04 -> 02:31:12
+```
+
+"What moved" is drawn from the four signals the watch tracks: liveness (the
+newer of the builder transcript and its `subagents/`), `HEAD`, `.git/index`,
+and the last commit's date. After a `RESUMED` the trigger may fire again.
+
+`stall` re-reports only when a further 40 minutes pass with **nothing** moving;
+the repeat block says `TRIGGER: stall (still, N min since the last report)`.
+
+### Event markers
+
+So a front end can forward triggers without forwarding banners, `watch_run.sh`
+brackets every event:
+
+```
+>>> EVENT tripwire
+…evidence block…
+<<< END EVENT
+>>> LINE RESUMED after stall (quiet 51.0 min): HEAD a9f6fd9 -> 7f68aca
+```
+
+`watch_monitor.sh` streams exactly those to stdout and everything else to
+`state/poll.log`. `watch_loop.sh` prints everything to the terminal.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | the invocation ran out its budget; non-terminal events may have been printed |
+| `10` | **finished** (terminal) |
+| `13` | **builder gone** (terminal) |
+| `2` | watcher error (no builder transcript found, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
+
+`11` (waiting on user), `12` (stall) and `14` (tripwire) name the triggers in
+prose and in `state/`; they are **not** exit codes any more, because those
+three no longer end an invocation.
+
+## Which transcript is the builder's
+
+Not "the newest file in the directory" —
+`/home/msi/.claude/projects/-home-msi-git-spanweave/` also holds aux-session
+transcripts, including the watching session's own, and builder transcripts from
+*earlier runs*.
+
+The derivation takes the run number. A candidate is a top-level `*.jsonl` in
+that directory whose most recent `"lastPrompt"`:
+
+1. mentions `WORKPLAN.md run N` or `Resume WORKPLAN.md` (case-insensitive), **and**
+2. names no run number other than `N` — any `run <digits>` in the prompt, **and**
+3. is not one of this tooling's own session files (`SPANWEAVE_SELF`, a list).
+
+Among candidates: the newest **`<stem>/subagents/` directory mtime** wins, then
+the transcript's own mtime, then the name. (That is the *derivation* tiebreak;
+*liveness* separately uses the newest mtime of any file anywhere under
+`subagents/`, which is the finer signal.) With no candidate the configured pin
+is used — an operator override, so it is not re-tested against the run number.
+With no candidate and no pin the script exits `2`.
+
+So a builder that is `/clear`ed and resumed after a usage-limit reset — which
+forks a brand-new transcript file — is followed instead of the old one being
+declared dead. When the chosen file differs from the pin, the banner says
+`<-- FOLLOWED (pin was …)`.
+
+**Why rule 2 exists.** On 2026-09-10 02:10 the watch derived onto
+`95360def-…jsonl`, whose `lastPrompt` is `Execute WORKPLAN.md run 1` — the
+*previous* run's builder. The old rule was "newest matching transcript", and
+`WORKPLAN\.md run` matched run 1 as happily as run 2, so the watch reported on a
+finished session while run 2 ran elsewhere. Rule 2 makes that impossible: run 1
+is excluded from a run-2 watch by name, whatever its mtime. `selftest.sh`
+asserts the exact case, from both directions and under either pin.
+
+`status_check.sh` prints the candidate list, the rejected files with the reason
+each was rejected, and whether the choice was `derived` or `pin (no candidate)`.
+
+## Liveness
+
+The builder's own transcript is silent for minutes at a time while a batch
+sub-agent runs; the file that moves is the sub-agent's. Liveness is therefore the
+**newer of**:
+
+- the builder transcript's mtime, and
+- the newest mtime anywhere under `<transcript-stem>/subagents/`.
+
+The last `pendingBackgroundAgentCount` seen in a `system` entry in the last 60
+lines is read as a secondary signal (`1` means a batch sub-agent is outstanding).
+
+## Triggers
+
+Evaluated in this order. The non-terminal ones do not stop the poll; a poll can
+therefore report a tripwire *and* a stall.
+
+**tripwire** — checked against every local commit not yet reported
+(`last_seen_head..HEAD`, seeded at the `--base` sha, minus `reported_commits`):
+
+- subject does not start with `plan:` but the commit touches `WORKPLAN.md`
+- touches `spanweave/` while the body names batch **F1** (F1 is memo-only; it
+  halts as `awaiting decision` if its design needs a model change)
+- touches `tests/serialized_shape.json` and the body does not mention
+  `serialized_shape`
+- the commit **declares** a batch outside the run list
+- the checked-out branch is not `audit-fixes`, or local `main` moved
+- `git stash list` grew
+
+Evidence: `git show --stat` plus subject and body for each newly reported
+commit, `git status --short`, `git stash list`, current branch, `main` sha.
+
+**What "declares a batch" means.** Only two forms count:
+
+- a body line `Batch <ID> of WORKPLAN.md …`
+- a subject `plan: <ID> …`
+
+A batch id anywhere else in the prose is a *citation*, not a declaration, and is
+ignored. The old rule scanned the whole subject+body for `\b[A-H]\d\b`, and on
+2026-09-10 02:10 it fired on `477fe9b` — a legitimate A6 commit whose body opens
+`Batch A6 of WORKPLAN.md.` and then explains what A1 had left undone. "A1" was
+read as a second declaration. Batch commits in this series routinely cite
+earlier batches (`A3's rule`, `C1's sentence is fixed by C3`), so the old rule
+was a false positive generator, not a tripwire. `selftest.sh` runs the real
+`477fe9b` message through it.
+
+*Still prose-matched:* the **F1** rule above scans the whole body for `\bF1\b`.
+That one is deliberately broad — it guards a halt point, and a false positive
+there is cheap now that a tripwire no longer stops the watch.
+
+**finished** *(terminal)* — `origin/audit-fixes` moved past the base, **and**
+local HEAD equals it, **and** no listed batch is `todo` or `in progress`.
+`done`, `dropped`, `awaiting …`, `blocked …` all count as stopped. Evidence:
+`git log --oneline <base>..HEAD`, the status line for each listed batch, the
+resume-note tail, `git status --short`.
+
+*Caveat:* a row stopped by a *dependency* marker (`E3 awaiting E2`) counts as
+stopped, so if the builder finishes the `todo` batches without ever flipping
+such a row, `finished` fires with work left undone. The evidence block prints a
+`note:` line listing exactly which rows are in that state, so the condition is
+visible rather than silent. (For run 2 the maintainer resolved all six of those
+markers to `todo` on 2026-09-10, so the caveat is currently inert.)
+
+**waiting on user** — the last substantive transcript entry is an assistant
+message that asks a question (trailing `?`, or an `AskUserQuestion` /
+`ExitPlanMode` tool use), **or** any of the last 30 entries contains a
+usage/rate-limit notice — and liveness has not moved for 10 minutes.
+Metadata records (`attachment`, `queue-operation`, `file-history-snapshot`,
+`cost-state`, `last-prompt`, `custom-title`, `agent-name`, `mode`,
+`permission-mode`, `atis-latch`, `bridge-session`, `summary`) are skipped when
+finding the last substantive entry. Evidence: the reason, the liveness block, the
+last 20 entries with type/role and 200-character previews, batch statuses.
+
+**builder gone** *(terminal)* — any PID from the set observed at arming time is
+no longer present while the run is incomplete. Which of the four `claude`
+processes is the builder is not knowable from outside, so the set shrinking is
+the signal. Evidence: `pgrep -af claude`, the missing PIDs, the still-active
+batches, the last 10 transcript entries, the liveness block.
+*Note:* if the human restarts sessions for an unrelated reason this fires on a
+stale PID set — re-arm with `--pids "…"`.
+
+**stall** — no new local commit, no `.git/index` mtime change, and no
+liveness movement for 40 minutes while a batch is in progress ("in progress" =
+some listed batch is `todo`/`in progress`, or `pendingBackgroundAgentCount > 0`;
+the builder marks a row `done` only *after* the batch lands, so a running batch
+shows as `todo`). Evidence: the three timestamps, `git status --short`,
+`pendingBackgroundAgentCount`.
+
+## State
+
+`state/` (gitignored):
+
+- `watch_state.json` — `last_seen_head`, `main_sha`, `stash_count`,
+  `last_poll`, `transcript`, `run`, `reported_commits` (the tripwire's
+  once-ever list, capped at 500), `reported_conditions` (level-triggered
+  tripwire conditions, currently only "wrong branch"), and `waiting` / `stall`
+  suppression records (each holds the four signal values at fire time plus
+  `fired_at`). Delete the file to re-baseline everything at `--base`.
+- `poll.log` — one banner line per poll, plus the full text of every event.
+- `last_evidence.txt` — the most recent evidence block.
+
+## Verified
+
+`./selftest.sh` — 34 cases, fixtures only, `~/git/spanweave` and the real
+transcript directory never touched. It covers: the eight rule-(a) shapes
+including the real `477fe9b` message; the rule-(b) derivation from both run
+directions, both tiebreaks, self-exclusion and the pin fallback; the `95360def`
+drift from both pins; and every dedup path — tripwire once-per-sha, waiting
+once-then-`RESUMED`-then-again, stall once-then-40-min-then-again, and both
+terminal exits.
+
+Earlier, 2026-09-10, against a throwaway fixture repo: exit `0` on a quiet poll
+and each trigger's evidence block rendering correctly.
+
+## Operational notes
+
+- The transcript tail is read by seeking the last 2 MB from the end of the file,
+  so a transcript that grows to tens of MB never enters memory whole. Candidate
+  transcripts are scanned line-by-line for `lastPrompt`, never slurped.
+- 2026-09-10 01:55: the first armed `watch_loop.sh` run was killed by the host's
+  low-memory guard while sleeping between polls — not by a trigger. A kill leaves
+  `state/poll.log` ending in an ordinary banner and no new event; that is how to
+  tell a kill from a trigger. State in `watch_state.json` survives, so re-running
+  resumes where it left off rather than re-reporting old commits.
+- 2026-09-10 02:00: killed a second time the same way. `watch_loop.sh` was
+  replaced as the arming path by `watch_monitor.sh`, run under the Monitor tool
+  with `persistent: true` (a session-length watch rather than a tracked
+  background bash task). `watch_loop.sh` still works for a plain terminal.
+- 2026-09-10 02:10: the two rules above were both wrong at once — the tripwire
+  fired on `477fe9b` (a prose citation) while watching `95360def` (run 1's
+  builder). Both are fixed here and both are self-tested.
+- 2026-09-10 02:45: triggers became report-and-continue except `finished` and
+  `builder gone`, so a false positive costs a paragraph rather than the watch.
