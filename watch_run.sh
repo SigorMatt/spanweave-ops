@@ -192,11 +192,17 @@ def main():
         last_commit_epoch = None
     stash_count = len([x for x in stashlist.splitlines() if x.strip()])
 
-    statuses, _rawrows = workplan_statuses(REPO)
+    statuses, _rawrows, plan_src = workplan_statuses(REPO)
     if statuses is None:
-        event("watcher error", "WATCHER ERROR: WORKPLAN.md unreadable at %s" % REPO)
+        event("watcher error",
+              "WATCHER ERROR: WORKPLAN.md is present but unreadable at %s" % REPO)
         return ERROR, events, st
-    active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
+    if plan_src == "absent":
+        # G4's row is "Series close: ... remove WORKPLAN.md". A closed plan has
+        # no rows, so nothing is active - that is the end state, not an error.
+        active = []
+    else:
+        active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
 
     # -- processes -----------------------------------------------------------
     pgrep_out = claude_processes()
@@ -213,7 +219,8 @@ def main():
                  "  <-- FOLLOWED (pin was %s)" % PINNED if followed else "",
                  headshort, origin[:7] if origin else "?", stamp(live), age(live, now),
                  pending, ",".join(active) if active else "(none)",
-                 " | suppressed: %s" % ",".join(suppressed) if suppressed else ""))
+                 ("%s%s" % (" | plan from %s" % plan_src if plan_src != "worktree" else "",
+                            " | suppressed: %s" % ",".join(suppressed) if suppressed else ""))))
     print(banner, flush=True)
     try:
         with open(LOG, "a") as fh:
@@ -222,7 +229,12 @@ def main():
         pass
 
     def status_block():
+        if plan_src == "absent":
+            return ("  WORKPLAN.md has been removed - the series is closed, so no\n"
+                    "  batch row remains and nothing counts as active.")
         rows = ["  %-3s %s" % (b, statuses.get(b, "<row missing>")) for b in BATCHES]
+        if plan_src != "worktree":
+            rows.insert(0, "  (rows read from %s: the working-tree file is gone)" % plan_src)
         notes = [b for b in BATCHES
                  if (statuses.get(b, "").strip().lower().startswith("awaiting")
                      and not statuses.get(b, "").strip().lower().startswith("awaiting decision"))]

@@ -16,7 +16,7 @@ behaviour contract; this file is how to run it.
 | `watch_loop.sh` | Arming path in a **plain terminal**. Re-invokes `watch_run.sh` forever, everything to the terminal. Stops on a terminal trigger. |
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 34 cases over throwaway fixtures. Proves both rules and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 50 cases over throwaway fixtures. Proves both rules and every dedup path. Touches neither the real repo nor the real transcript directory. |
 
 ## Invocations
 
@@ -88,6 +88,14 @@ RESUMED after stall (quiet 51.0 min): liveness 02:10:04 -> 03:01:12; HEAD a9f6fd
 ```
 
 `WATCH.md` has the full definition of each trigger and its evidence block.
+
+## The series ends by deleting the plan
+
+G4, the last batch, removes `WORKPLAN.md`. The watch reads the rows from the
+working tree, else from `HEAD` while the deletion is staged, else treats the
+plan as **closed** — no rows, nothing active, `finished` reachable. A missing
+plan is never a watcher error; a present-but-unreadable one still is, after two
+retries.
 
 ## Exit codes
 

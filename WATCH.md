@@ -141,6 +141,28 @@ asserts the exact case, from both directions and under either pin.
 `status_check.sh` prints the candidate list, the rejected files with the reason
 each was rejected, and whether the choice was `derived` or `pin (no candidate)`.
 
+## Where the batch rows come from
+
+The last batch of the series, **G4**, is *"Series close: … remove
+`WORKPLAN.md` and its README row"*. The file the watch reads is deleted on
+purpose at the end. So "no `WORKPLAN.md`" is a planned end state, not a
+failure, and the rows are looked for in three places in order:
+
+| source | when | effect |
+|---|---|---|
+| `worktree` | normal | rows as written |
+| `HEAD` | the deletion is staged but not yet committed | rows from the committed copy; the banner says `plan from HEAD` |
+| `absent` | gone from the worktree *and* from `HEAD` | no rows remain, so **nothing counts as active** and `finished` becomes reachable; the banner says `plan from absent` |
+
+A file that *is* there and cannot be read is retried twice (the builder
+rewrites it in place between batches) and only then is a watcher error.
+
+On 2026-09-10 04:25 the watch died `exit 2` in the second row of that table:
+G4 had staged the deletion, the working-tree file was gone, and the watcher
+treated a missing file as unreadable. Four `selftest.sh` cases now cover the
+staged deletion, the committed deletion, `finished` reached with the plan
+closed, and the still-an-error case.
+
 ## Liveness
 
 The builder's own transcript is silent for minutes at a time while a batch
@@ -244,13 +266,14 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 34 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 50 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the eight rule-(a) shapes
 including the real `477fe9b` message; the rule-(b) derivation from both run
 directions, both tiebreaks, self-exclusion and the pin fallback; the `95360def`
 drift from both pins; and every dedup path — tripwire once-per-sha, waiting
 once-then-`RESUMED`-then-again, stall once-then-40-min-then-again, and both
-terminal exits.
+terminal exits; and the series-close cases, where `WORKPLAN.md` is deleted
+staged, then committed, then reached `finished` with the plan closed.
 
 Earlier, 2026-09-10, against a throwaway fixture repo: exit `0` on a quiet poll
 and each trigger's evidence block rendering correctly.
@@ -274,3 +297,11 @@ and each trigger's evidence block rendering correctly.
   builder). Both are fixed here and both are self-tested.
 - 2026-09-10 02:45: triggers became report-and-continue except `finished` and
   `builder gone`, so a false positive costs a paragraph rather than the watch.
+- 2026-09-10 04:37: the tripwire fired on `ff05b2d` — F2's implementation
+  commit, whose body cites F1 three times to say F1 did *not* halt. The F1 rule
+  is the one left prose-matched on purpose; the hit was a false positive and,
+  under the new policy, cost one paragraph. F1's own commit `c943543` is
+  docs-only, so the thing the rule guards against did not happen.
+- 2026-09-10 04:25: the watch died `exit 2` when G4 staged the deletion of
+  `WORKPLAN.md`. Fixed above — the plan now has three sources and an absent
+  plan is a closed series, not an error.

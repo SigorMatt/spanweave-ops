@@ -399,6 +399,73 @@ printf '%s\n' "$out" | grep -q "terminal, watch stops" \
   && ok "the finished block says the watch stops" \
   || bad "the finished block does not say the watch stops"
 
+# ---------------------------------------------------------------------------
+echo
+echo "series close - G4 removes WORKPLAN.md, and the watch must survive it"
+# ---------------------------------------------------------------------------
+python3 - "$ST2/watch_state.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+for k in ("waiting", "stall"): st.pop(k, None)
+json.dump(st, open(sys.argv[1], "w"), indent=2, sort_keys=True)
+PY
+transcript "Closing the series."
+touch "$BUILDER"
+
+# Keep HEAD ahead of origin so `finished` cannot fire and mask these cases.
+git -C "$R2" commit -q --allow-empty -m "chore: hold HEAD ahead of origin"
+
+# (1) staged deletion: gone from the worktree, still committed at HEAD.
+git -C "$R2" rm -q --cached WORKPLAN.md && rm -f "$R2/WORKPLAN.md"
+check "a staged WORKPLAN.md deletion does not kill the watch" "$(run2)" "0|"
+grep -q "plan from HEAD" "$TMP/last_run.txt" \
+  && ok "the banner says the rows came from HEAD" \
+  || bad "the banner does not say where the rows came from"
+
+# (2) committed deletion: gone from the worktree and from HEAD.
+git -C "$R2" commit -q -m "plan: series closed, WORKPLAN.md removed"
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+rc=$?
+check "a committed WORKPLAN.md deletion does not raise a watcher error" \
+      "$(printf '%s' "$rc" | sed 's/^2$/WATCHER ERROR/')" "0"
+printf '%s\n' "$out" | grep -q "plan from absent" \
+  && ok "the banner reports the plan as absent" \
+  || bad "the banner does not report the plan as absent"
+printf '%s\n' "$out" | grep -q "active: (none)" \
+  && ok "a closed plan leaves no batch active" \
+  || bad "a closed plan still shows an active batch"
+
+# (3) with the plan closed and the branch pushed, `finished` is reachable.
+git -C "$R2" push -q origin audit-fixes
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+check "a closed, pushed plan still reaches finished" "$?" "10"
+printf '%s\n' "$out" | grep -q "the series is closed" \
+  && ok "the finished block says the series is closed" \
+  || bad "the finished block does not say the series is closed"
+
+# (4) a present-but-unreadable plan is still a watcher error.
+git -C "$R2" revert --no-edit HEAD >/dev/null 2>&1
+chmod 000 "$R2/WORKPLAN.md"
+if [ -r "$R2/WORKPLAN.md" ]; then
+  ok "skipped: this filesystem/user can read a 000 file"
+else
+  SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+  SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+  SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+  SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+  "$OPS_DIR/watch_run.sh" --once --run 2 >/dev/null 2>&1
+  check "a present-but-unreadable plan is still a watcher error" "$?" "2"
+fi
+chmod 644 "$R2/WORKPLAN.md"
+
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
 exit "$fail"

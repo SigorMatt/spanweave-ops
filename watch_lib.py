@@ -292,13 +292,47 @@ def pending_agents(entries):
 ROW_RE = re.compile(r"^\|\s*(%s)\s*\|" % BATCH_ID)
 
 
-def workplan_statuses(repo):
+def _workplan_lines(repo):
+    """The plan's lines and where they came from.
+
+    G4 - the series-close batch - *removes* WORKPLAN.md, so "the file is not
+    there" is a planned end state, not a failure.  Three sources, in order:
+
+      "worktree"  the file on disk
+      "HEAD"      the committed copy, while the deletion is staged but not
+                  yet committed (the window this watcher died in)
+      "absent"    gone from both: the plan is closed, so there are no rows
+                  and nothing is active
+
+    A present-but-unreadable file is retried twice before it counts as an
+    error, because the builder rewrites it in place between batches.
+    """
     path = os.path.join(repo, "WORKPLAN.md")
-    try:
-        with open(path, errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return None, None
+    for attempt in range(3):
+        if not os.path.exists(path):
+            break
+        try:
+            with open(path, errors="replace") as fh:
+                return fh.read().splitlines(), "worktree"
+        except OSError:
+            if attempt == 2:
+                return None, "unreadable"
+            time.sleep(0.2)
+    rc, out, _ = git_in(repo)("show", "HEAD:WORKPLAN.md")
+    if rc == 0 and out.strip():
+        return out.splitlines(), "HEAD"
+    return [], "absent"
+
+
+def workplan_statuses(repo):
+    """-> (statuses, raw_rows, source).  `statuses` is None only when the file
+    is there and cannot be read; an absent plan gives {} with source
+    "absent"."""
+    lines, source = _workplan_lines(repo)
+    if lines is None:
+        return None, None, source
+    if source == "absent":
+        return {}, {}, source
     start = None
     for i, line in enumerate(lines):
         if line.startswith("## 1."):
@@ -321,7 +355,7 @@ def workplan_statuses(repo):
             continue
         out[m.group(1)] = fields[-3].strip().replace("\x00", "|")
         raw[m.group(1)] = line
-    return out, raw
+    return out, raw, source
 
 
 def is_stopped(status):
@@ -332,12 +366,11 @@ def is_stopped(status):
 
 
 def resume_note_tail(repo, n=12):
-    path = os.path.join(repo, "WORKPLAN.md")
-    try:
-        with open(path, errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
+    lines, source = _workplan_lines(repo)
+    if lines is None:
         return ["<WORKPLAN.md unreadable>"]
+    if source == "absent":
+        return ["<WORKPLAN.md removed - the series is closed>"]
     start = None
     for i, line in enumerate(lines):
         if line.startswith("## 4. Resume note"):

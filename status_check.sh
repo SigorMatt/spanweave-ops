@@ -105,20 +105,28 @@ print(stashlist or "  (empty)")
 
 # --------------------------------------------------------- plan statuses ---
 head("plan statuses (WORKPLAN.md section 1, run %d)" % RUN)
-statuses, _raw = workplan_statuses(REPO)
+statuses, _raw, plan_src = workplan_statuses(REPO)
 if statuses is None:
-    print("WATCHER ERROR: WORKPLAN.md unreadable at %s" % REPO)
+    print("WATCHER ERROR: WORKPLAN.md is present but unreadable at %s" % REPO)
     sys.exit(2)
-active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
-for b in BATCHES:
-    print("  %-3s %s" % (b, statuses.get(b, "<row missing>")))
-notes = [b for b in BATCHES
+if plan_src == "absent":
+    # G4 removes WORKPLAN.md on series close; a closed plan has no active batch.
+    active = []
+    print("  WORKPLAN.md has been removed - the series is closed, so no batch")
+    print("  row remains and nothing counts as active.")
+else:
+    active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
+    if plan_src != "worktree":
+        print("  (rows read from %s: the working-tree file is gone)" % plan_src)
+    for b in BATCHES:
+        print("  %-3s %s" % (b, statuses.get(b, "<row missing>")))
+notes = [] if plan_src == "absent" else [b for b in BATCHES
          if (statuses.get(b, "").strip().lower().startswith("awaiting")
              and not statuses.get(b, "").strip().lower().startswith("awaiting decision"))]
 if notes:
     print("  note: stopped by a dependency marker, not a decision: %s"
           % ", ".join("%s (%s)" % (b, statuses[b]) for b in notes))
-missing_rows = [b for b in BATCHES if b not in statuses]
+missing_rows = [] if plan_src == "absent" else [b for b in BATCHES if b not in statuses]
 if missing_rows:
     print("  note: no section-1 row yet for: %s" % ", ".join(missing_rows))
 print()
