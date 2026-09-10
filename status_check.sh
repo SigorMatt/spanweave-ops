@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --run)     export SPANWEAVE_RUN="$2"; shift 2 ;;
     --batches) export SPANWEAVE_BATCHES="$2"; shift 2 ;;
+    --memo)    export SPANWEAVE_MEMO="$2"; shift 2 ;;
     --base)    export SPANWEAVE_BASE="$2"; shift 2 ;;
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
@@ -38,10 +39,11 @@ python3 - <<'PY'
 import os, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (age, claude_processes, config, derive_transcript,
-                       entry_line, git_in, is_stopped, live_pids, mtime,
-                       newest_under, pending_agents, resume_note_tail, stamp,
-                       subagents_dir, tail_entries, workplan_statuses)
+from watch_lib import (age, asks_question, claude_processes, config,
+                       declared_batches, derive_transcript, entry_line, git_in,
+                       is_stopped, limit_notice, live_pids, mtime, newest_under,
+                       pending_agents, resume_note_tail, stamp, subagents_dir,
+                       substantive, tail_entries, verdict, workplan_statuses)
 
 CFG     = config()
 REPO    = CFG["repo"]
@@ -52,6 +54,7 @@ BRANCH  = CFG["branch"]
 RUN     = CFG["run"]
 PIDSET  = CFG["pids"]
 BATCHES = CFG["batches"]
+MEMO    = CFG["memo"]
 
 now = time.time()
 git = git_in(REPO)
@@ -210,22 +213,54 @@ else:
             print("    " + entry_line(e))
 
 # -------------------------------------------------------------- verdict ---
-quiet_min = (now - live) / 60.0 if live else None
-if missing_pids:
-    state = "BUILDER GONE (%d of %d arming PIDs missing)" % (len(missing_pids), len(PIDSET))
-elif quiet_min is None:
-    state = "UNKNOWN (no liveness signal)"
-elif quiet_min >= 40:
-    state = "QUIET %.1f min (>= stall threshold)" % quiet_min
-elif quiet_min >= 10:
-    state = "QUIET %.1f min (>= waiting threshold)" % quiet_min
-else:
-    state = "ALIVE (liveness %.1f min ago)" % quiet_min
-pushed = "pushed" if origin and origin == headsha else "NOT pushed (origin %s)" % (origin[:7] if origin else "?")
+# One closed-vocabulary line, then the evidence it was derived from.  The
+# vocabulary is documented in README.md; nothing else may appear on the
+# VERDICT line, because a caller is meant to be able to match it exactly.
+head("verdict")
+
+# Which of this run's batches a commit since base actually declared.  This is
+# what separates "not started" from "underway" when every row still says todo,
+# and it uses rule (a), so a commit that merely *cites* a batch does not count.
+_, shas, _ = git("log", "--format=%H", "%s..HEAD" % BASE)
+declared_since_base = []
+for sha in [x for x in shas.splitlines() if x.strip()]:
+    _, dsubj, _ = git("log", "-1", "--format=%s", sha)
+    _, dbody, _ = git("log", "-1", "--format=%b", sha)
+    for b in declared_batches(dsubj, dbody):
+        if b in BATCHES and b not in declared_since_base:
+            declared_since_base.append(b)
+
+subs = substantive(entries)
+asks, asks_why = (asks_question(subs[-1]) if subs else (False, ""))
+limit_hit = limit_notice(entries)
+quiet_s = (now - live) if live else None
+is_pushed = bool(origin) and origin == headsha
+
+v, why = verdict(statuses, plan_src, BATCHES, how, quiet_s, is_pushed,
+                 asks, bool(limit_hit), declared_since_base)
+
+pushed_txt = ("pushed" if is_pushed
+              else "NOT pushed (origin %s)" % (origin[:7] if origin else "?"))
 print()
-print("VERDICT: %s | run %d: %d/%d batches stopped, active: %s | HEAD %s %s | branch %s"
-      % (state, RUN, len(BATCHES) - len(active), len(BATCHES),
-         ", ".join(active) if active else "(none)", headshort, pushed, curbranch))
+print("VERDICT: %s" % v)
+print()
+print("  why       : %s" % why)
+print("  liveness  : %s (%s ago) | transcript %s [%s]"
+      % (stamp(live), age(live, now), tname, how))
+print("  batches   : run %d: %d/%d stopped, active: %s"
+      % (RUN, len(BATCHES) - len(active), len(BATCHES),
+         ", ".join(active) if active else "(none)"))
+print("  declared  : %s" % (", ".join(declared_since_base) or "(none since %s)" % BASE))
+print("  head      : %s %s | branch %s | plan rows from %s"
+      % (headshort, pushed_txt, curbranch, plan_src))
+if missing_pids:
+    print("  processes : %d of %d arming PIDs missing: %s"
+          % (len(missing_pids), len(PIDSET),
+             " ".join(str(p) for p in missing_pids)))
+if asks:
+    print("  question  : %s" % asks_why)
+if limit_hit:
+    print("  limit     : %r at %s" % (limit_hit[1], limit_hit[0]))
 print()
 print("TRANSCRIPT_DIR=%s" % TDIR)
 print("TRANSCRIPT_FILE=%s" % tpath)

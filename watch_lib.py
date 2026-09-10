@@ -20,8 +20,10 @@ import time
 DEF_REPO   = os.path.expanduser("~/git/spanweave")
 DEF_TDIR   = os.path.expanduser("~/.claude/projects/-home-msi-git-spanweave")
 DEF_PINNED = "28018437-a07a-443c-b854-7c4589983fc7.jsonl"
-# Every watcher/aux session that has ever run this tooling from inside the same
-# project directory.  A watcher must never derive onto itself.
+# Watcher/aux sessions that ran this tooling from inside the same project
+# directory in the *past*.  A watcher must never derive onto itself, and a
+# static list cannot know about the session it is running in, so this list is
+# only the historical part of the answer - `self_names()` adds the live one.
 DEF_SELF   = ("c2a395dd-9fdb-4c60-8878-b3c4e7a5a48d.jsonl "
               "05be40ff-b82d-4a92-bc3c-df42832b095c.jsonl")
 DEF_BASE   = "c79cbc5"
@@ -29,6 +31,14 @@ DEF_BRANCH = "audit-fixes"
 DEF_RUN    = "2"
 DEF_PIDS   = "820503 820602 820711 820816"
 DEF_BATCHES = "A5 A6 A7 A8 B3 A9 C3 D2 H2 G5 E2 E3 E4 F1 F2 G4"
+# Memo-only batches: they end `awaiting decision` and must never touch
+# spanweave/.  Per-run, so it is configurable (run 2: F1; run 3: R3).
+DEF_MEMO   = "F1"
+
+# Liveness must be still this long before a question or a limit notice is read
+# as "waiting on user" rather than as a session mid-thought.  Shared with
+# watch_run.sh so the watch and the one-shot report agree.
+WAIT_QUIET_S = 10 * 60
 
 
 def config():
@@ -47,7 +57,31 @@ def config():
                     .replace(",", " ").split()],
         "batches": os.environ.get("SPANWEAVE_BATCHES", DEF_BATCHES)
                    .replace(",", " ").split(),
+        "memo":    os.environ.get("SPANWEAVE_MEMO", DEF_MEMO)
+                   .replace(",", " ").split(),
     }
+
+
+def self_names(cfg):
+    """Transcript filenames this watcher must never derive onto.
+
+    Two sources, because neither alone is right:
+
+      * `SPANWEAVE_SELF` / `DEF_SELF` - watcher and aux sessions from earlier,
+        which a live check cannot see because they are no longer running;
+      * `CLAUDE_CODE_SESSION_ID` - *this* session, which no static list can
+        contain, because the list is written before the session exists.
+
+    The second is the one that matters in practice: a stale static list let a
+    watcher derive onto its own transcript, and loosening the prompt rule (see
+    `is_builder_prompt`) makes that more likely, not less - a watcher session
+    is told about `WORKPLAN.md` and about the run number too.
+    """
+    names = set(cfg.get("self") or [])
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if sid:
+        names.add(sid + ".jsonl")
+    return names
 
 
 # -------------------------------------------------------------- tiny helpers
@@ -107,7 +141,12 @@ def git_in(repo):
 # "Batch A6 of WORKPLAN.md." and then explained what A1 had left undone, and
 # the old whole-blob `\b([A-H]\d)\b` scan read "A1" as a second declaration.
 
-BATCH_ID = r"[A-H]\d+"
+# Prefix-agnostic on purpose.  Run 2's batches were A-H; run 3's are R1-R7, and
+# `[A-H]\d+` made every run-3 row, and every run-3 declaration, invisible to the
+# whole watcher - rows read as "<row missing>", so "0/7 stopped, active: all
+# seven" was a default, not an observation.  A batch id is a capital letter and
+# digits; which letter is the plan's business, not the watcher's.
+BATCH_ID = r"[A-Z]\d+"
 DECL_BODY_RE = re.compile(r"^\s*Batch\s+(%s)\s+of\s+WORKPLAN\.md\b" % BATCH_ID,
                           re.I | re.M)
 DECL_SUBJ_RE = re.compile(r"^\s*plan:\s*(%s)\b" % BATCH_ID, re.I)
@@ -127,24 +166,93 @@ def declared_batches(subject, body):
 #
 # Candidates are top-level *.jsonl in TDIR whose most recent "lastPrompt":
 #
-#   * mentions "WORKPLAN.md run N" or "Resume WORKPLAN.md", and
+#   * is a builder prompt for run N (see `is_builder_prompt`), and
 #   * names no run number other than N, and
-#   * is not one of this tooling's own session files.
+#   * is not this session's transcript, nor a known past watcher/aux one.
 #
 # Among candidates: newest `<stem>/subagents/` directory mtime wins, then the
 # transcript's own mtime.  With no candidate the configured pin is used - an
 # operator override, so it is not re-tested against the run number.
 #
-# Under this rule the 95360def drift cannot recur: its lastPrompt is
-# "Execute WORKPLAN.md run 1", which fails the run-N match *and* names run 1.
+# Under this rule the 95360def drift cannot recur: its lastPrompt names run 1,
+# so it is excluded from a run-2 watch by rule 2 whatever its mtime.
 
 LP_RE = re.compile(r'"lastPrompt"\s*:\s*"((?:[^"\\]|\\.)*)"')
-RUNNUM_RE = re.compile(r"\brun\s*#?\s*(\d+)\b", re.I)
+# Two regexes, because naming a run and *being about* a run are different
+# questions.
+#
+# RUNNUM_RE is the broad one: every way a run number can appear, including the
+# hyphenated `run-2`.  It answers "which runs does this prompt mention at all",
+# which is what rule 2 needs.
+#
+# RUN_TOKEN is the narrow one, and deliberately excludes `run-N`.  In this
+# corpus the hyphenated form is always adjectival - a *citation* of an earlier
+# run modifying a noun ("run-2 review findings", "run-1 concerns") - while the
+# operative form is spaced or bare: "run 3", "run #3", and the `run3-...` of a
+# handover filename, where the digit is attached to the word and the hyphen
+# comes after it.  Without this split, "reopen for run 3 -- run-2 review
+# findings" reads as a run-2 builder prompt as readily as a run-3 one, and a
+# run-2 watch would follow run 3's builder.
+RUNNUM_RE  = re.compile(r"\brun\s*[#_-]?\s*(\d+)", re.I)
+RUN_TOKEN  = r"\brun\s*[#_]?\s*0*%d\b"
+PLAN_RE    = re.compile(r"WORKPLAN\.md", re.I)
+RESUME_RE  = re.compile(r"Resume\s+WORKPLAN\.md", re.I)
+
+# The aux sessions - reviewers and watchers - talk about the plan and name the
+# run, so once the prompt rule stopped demanding the literal `WORKPLAN.md run
+# N` they became candidates too: a run-2 check derived onto "Cold review of run
+# 2 of the spanweave audit series", an aux reviewer, over the builder.
+#
+# What separates them is not vocabulary but *position*.  An aux prompt says
+# what it is in its opening words; a builder prompt says "Execute" or "Apply"
+# and only later mentions, say, "run-2 review findings" - run 3's builder
+# prompt contains the word "review", 150 characters in.  So this is matched
+# against the head of the prompt only.
+AUX_HEAD   = 80
+AUX_RE     = re.compile(
+    r"\breview(ing|ed|er|s)?\b|\bwatch(ing)?\b|\bre-?arm\b|\baudit\b|"
+    r"\breport\s+only\b|\bchange\s+nothing\b|\bone-off\s+helper\b", re.I)
 
 
-def want_re(run):
-    return re.compile(r"WORKPLAN\.md\s+run\s+0*%d\b|Resume\s+WORKPLAN\.md" % int(run),
-                      re.I)
+def is_aux_prompt(lp):
+    """Does this prompt open by announcing itself as a reviewer or a watcher?"""
+    return bool(AUX_RE.search((lp or "")[:AUX_HEAD]))
+
+
+def run_token_re(run):
+    return re.compile(RUN_TOKEN % int(run), re.I)
+
+
+def is_builder_prompt(lp, run):
+    """Is this lastPrompt a builder being told to work run N?
+
+    The old rule demanded the literal phrase `WORKPLAN.md run N` (or
+    `Resume WORKPLAN.md`).  Run 3's builder was started with
+
+        Apply ~/Downloads/run3-2026-09-11.md with one plan-only sub-agent
+        (recreate WORKPLAN.md from git show c79cbc5:...)
+
+    which is unambiguously a run-3 builder and matched neither form, so the
+    watch fell back to the pin - the *run-2* transcript - and read a finished
+    session's liveness as though run 3 were alive.
+
+    The rule is therefore split into its two real parts: the prompt must be
+    about the plan, and it must name the run.  Either the two are adjacent
+    (`WORKPLAN.md run 3`) or they are not (`run3-....md` ... `WORKPLAN.md`);
+    the watcher has no business caring which.  `Resume WORKPLAN.md` still
+    stands alone, because a resumed session need not restate the run.
+
+    "Names the run" here means the operative form only - see RUN_TOKEN: a
+    prompt that merely *cites* `run-2` while directing run 3 is a run-3 builder
+    prompt and not a run-2 one.
+    """
+    if not lp:
+        return False
+    if is_aux_prompt(lp):
+        return False
+    if RESUME_RE.search(lp):
+        return True
+    return bool(PLAN_RE.search(lp)) and bool(run_token_re(run).search(lp))
 
 
 def last_prompt(path):
@@ -176,22 +284,33 @@ def derive_transcript(cfg):
     candidates is a list of (sub_mtime, own_mtime, name, lastPrompt), best
     first.  `how` is "derived", "pin (no candidate)" or "none"."""
     run = cfg["run"]
-    want = want_re(run)
+    mine = self_names(cfg)
     cands, rejected = [], []
     for path in sorted(glob.glob(os.path.join(cfg["tdir"], "*.jsonl"))):
         name = os.path.basename(path)
-        if name in cfg["self"]:
-            rejected.append((name, "own session file"))
-            continue
         lp = last_prompt(path)
+        if name in mine:
+            # Only worth reporting when it would otherwise have been a
+            # candidate; the directory holds dozens of unrelated sessions and
+            # listing them all as "rejected" buries the ones that matter.
+            if is_builder_prompt(lp, run):
+                rejected.append((name, "this watcher's own session file"))
+            continue
         if not lp:
             continue
-        if not want.search(lp):
+        if not is_builder_prompt(lp, run):
             continue
+        # Rule 2, and the same citation/declaration distinction as rule (a):
+        # a run number the prompt *also* mentions is only disqualifying when
+        # the prompt never names run N itself.  Run 3's builder was started
+        # with "...single commit plan: reopen for run 3 -- run-2 review
+        # findings", which names run 3 and cites run 2; the old "names no run
+        # other than N" test threw it out for the citation.  A prompt that
+        # names N is about N, whatever else it refers to.
         named = set(int(x) for x in RUNNUM_RE.findall(lp))
         other = sorted(named - {run})
-        if other:
-            rejected.append((name, "lastPrompt names run %s, not run %d"
+        if other and run not in named:
+            rejected.append((name, "lastPrompt names run %s, never run %d"
                              % (", ".join(str(x) for x in other), run)))
             continue
         cands.append((mtime(subagents_dir(cfg["tdir"], name)) or 0.0,
@@ -277,6 +396,46 @@ def substantive(entries):
     return [e for e in entries if e.get("type") not in SKIP_TYPES]
 
 
+QUESTION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+LIMIT_RE = re.compile(
+    r"usage limit|rate.?limit|quota exceeded|resets? at \d|"
+    r"upgrade to increase|limit will reset", re.I)
+
+
+def asks_question(entry):
+    """-> (bool, why).  The last substantive assistant entry is a question if
+    it used a question tool or its final line ends in a question mark."""
+    if entry.get("type") != "assistant":
+        return False, ""
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return False, ""
+    texts = []
+    for b in content:
+        if b.get("type") == "tool_use" and b.get("name") in QUESTION_TOOLS:
+            return True, "tool_use %s" % b.get("name")
+        if b.get("type") == "text":
+            texts.append(b.get("text", ""))
+    body = "\n".join(texts).strip()
+    if not body:
+        return False, ""
+    tail = body[-400:]
+    if "?" in tail.split("\n")[-1] or tail.rstrip().endswith("?"):
+        return True, "trailing question mark"
+    return False, ""
+
+
+def limit_notice(entries, n=30):
+    """-> (timestamp, matched text) for the most recent usage/rate-limit notice
+    in the last n entries, else None."""
+    hit = None
+    for e in entries[-n:]:
+        m = LIMIT_RE.search(json.dumps(e))
+        if m:
+            hit = (e.get("timestamp"), m.group(0))
+    return hit
+
+
 def pending_agents(entries):
     val = None
     for e in entries:
@@ -359,10 +518,110 @@ def workplan_statuses(repo):
 
 
 def is_stopped(status):
+    """Prefix-matched, all four words.  The plan does not write a bare `done`:
+    it writes ``done (`0e4262e`)``, and the exact-match test on "done" and
+    "dropped" read every completed run-3 batch as still active.  `awaiting` and
+    `blocked` were already prefix-matched for exactly this reason - the three
+    forms just never met a `done` with a sha on it until the rows became
+    visible at all."""
     s = (status or "").strip().lower()
-    return (s in ("done", "dropped")
-            or s.startswith("awaiting")
-            or s.startswith("blocked"))
+    return s.startswith(("done", "dropped", "awaiting", "blocked"))
+
+
+def is_running(status):
+    """A row that says work is happening *now*.  `todo` is not running, and a
+    stopped status is not running; anything else the plan writes in that
+    column - `in progress`, `running`, `dispatched` - is."""
+    s = (status or "").strip().lower()
+    if not s or s in ("todo", "-", "not started") or is_stopped(s):
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ verdict
+#
+# One line, one of exactly six values.  The point of a closed vocabulary is
+# that the reader never has to interpret: `status_check.sh` used to print
+# `ALIVE (liveness 5.7 min ago) | run 3: 0/7 batches stopped, active: <all
+# seven>`, every word of which was true and which together said the opposite
+# of the truth - the liveness was a `/clear` in a *finished* run-2 session, and
+# the seven "active" batches were seven rows the parser could not see.
+
+V_NOT_STARTED = "not started"
+V_APPLYING    = "applying plan"
+V_UNDERWAY    = "underway: batch %s"
+V_WAITING     = "waiting on user"
+V_FINISHED    = "finished"
+V_UNCLEAR     = "unclear"
+
+
+def verdict(statuses, source, batches, how, quiet_s, pushed,
+            asks, limit_hit, declared_since_base):
+    """-> (verdict line, one-line reason).
+
+    Pure: every argument is evidence already gathered by the caller, so the
+    rule is testable without a repo, a transcript or a clock.
+
+      statuses            {batch id: status} from WORKPLAN.md section 1
+      source              "worktree" | "HEAD" | "absent" | "unreadable"
+      batches             the run's batch list, in order
+      how                 "derived" | "pin (no candidate)" | "none"
+      quiet_s             seconds since the newest liveness signal, or None
+      pushed              HEAD == origin/<branch>
+      asks / limit_hit    the two "waiting on user" signals
+      declared_since_base batch ids of this run declared by a commit since base
+    """
+    if statuses is None or source == "unreadable":
+        return V_UNCLEAR, "WORKPLAN.md is present but cannot be read"
+
+    live = quiet_s is not None and quiet_s < WAIT_QUIET_S
+    quiet = quiet_s is not None and quiet_s >= WAIT_QUIET_S
+
+    # Blocked on a human outranks whatever the plan says: the run is not
+    # advancing and no amount of batch bookkeeping changes that.
+    if (asks or limit_hit) and quiet:
+        return V_WAITING, ("the last assistant entry asks a question"
+                           if asks else
+                           "a usage/rate-limit notice is in the recent entries")
+
+    if source == "absent":
+        if pushed:
+            return V_FINISHED, "WORKPLAN.md is gone and HEAD is pushed"
+        return V_UNCLEAR, "WORKPLAN.md is gone but HEAD is not pushed"
+
+    # A plan that is present but has no row for any batch of this run is not
+    # describing this run.  Asking a run-2 question after run 3 recreated
+    # WORKPLAN.md gave "0/16 stopped, active: <all sixteen>" - sixteen absent
+    # rows defaulting to todo - and then "underway: batch A5" for a run that
+    # finished a day earlier.  Absent rows are the absence of evidence.
+    if not any(b in statuses for b in batches) and declared_since_base:
+        return V_UNCLEAR, ("WORKPLAN.md has no row for any batch of this run, "
+                           "yet %d of them are committed" % len(declared_since_base))
+
+    active = [b for b in batches if not is_stopped(statuses.get(b, "todo"))]
+
+    if not active:
+        if pushed:
+            return V_FINISHED, "every batch is stopped and HEAD is pushed"
+        if live:
+            return V_APPLYING, "every batch is stopped but HEAD is not pushed yet"
+        return V_UNCLEAR, "every batch is stopped, HEAD is not pushed, nothing is live"
+
+    running = [b for b in batches if is_running(statuses.get(b))]
+    if running:
+        return V_UNDERWAY % running[0], "its row says %r" % statuses[running[0]]
+    if declared_since_base:
+        return (V_UNDERWAY % active[0],
+                "batch(es) %s already committed; %s is the first row still open"
+                % (", ".join(declared_since_base), active[0]))
+
+    # Nothing has moved on any batch.  The builder is either mid-setup or has
+    # not been started at all, and the transcript is what tells them apart.
+    if how == "derived" and live:
+        return V_APPLYING, "a builder for this run is live, no batch declared yet"
+    if how == "derived":
+        return V_UNCLEAR, "a builder for this run exists but is quiet and has declared nothing"
+    return V_NOT_STARTED, "no builder transcript for this run, and no batch declared"
 
 
 def resume_note_tail(repo, n=12):

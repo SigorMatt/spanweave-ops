@@ -16,7 +16,7 @@
 # file mtimes, pgrep, transcript tails.  Never writes to the repo.  Never runs
 # make, uv, or pytest.  Its only writes are under state/.
 #
-# usage: watch_run.sh [--once] [--run N] [--batches "A5 A6 ..."]
+# usage: watch_run.sh [--once] [--run N] [--batches "A5 A6 ..."] [--memo "F1"]
 #                     [--base SHA] [--branch NAME] [--pids "P P P"]
 #
 # Exit codes: 0 nothing terminal (non-terminal events may have been printed)
@@ -39,11 +39,12 @@ while [ $# -gt 0 ]; do
     --once)    ONCE=1; shift ;;
     --run)     export SPANWEAVE_RUN="$2"; shift 2 ;;
     --batches) export SPANWEAVE_BATCHES="$2"; shift 2 ;;
+    --memo)    export SPANWEAVE_MEMO="$2"; shift 2 ;;
     --base)    export SPANWEAVE_BASE="$2"; shift 2 ;;
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--base SHA] [--branch NAME] [--pids \"P P P\"]" >&2; exit 2 ;;
+    *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--memo \"F1\"] [--base SHA] [--branch NAME] [--pids \"P P P\"]" >&2; exit 2 ;;
   esac
 done
 
@@ -54,11 +55,12 @@ while :; do
 import json, os, re, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (age, claude_processes, config, declared_batches,
-                       derive_transcript, entry_line, git_in, is_stopped,
-                       live_pids, mtime, newest_under, pending_agents, render,
-                       resume_note_tail, stamp, subagents_dir, substantive,
-                       tail_entries, workplan_statuses)
+from watch_lib import (WAIT_QUIET_S, age, asks_question, claude_processes,
+                       config, declared_batches, derive_transcript, entry_line,
+                       git_in, is_stopped, limit_notice, live_pids, mtime,
+                       newest_under, pending_agents, render, resume_note_tail,
+                       stamp, subagents_dir, substantive, tail_entries,
+                       workplan_statuses)
 
 CFG    = config()
 REPO   = CFG["repo"]
@@ -69,15 +71,16 @@ BRANCH = CFG["branch"]
 RUN    = CFG["run"]
 PIDSET = CFG["pids"]
 BATCHES = CFG["batches"]
-MEMO   = {"F1"}
+MEMO   = set(CFG["memo"])          # memo-only batches for this run
 
 STATE_DIR = os.environ["SPANWEAVE_STATE_DIR"]
 STATE     = os.path.join(STATE_DIR, "watch_state.json")
 EVIDENCE  = os.path.join(STATE_DIR, "last_evidence.txt")
 LOG       = os.path.join(STATE_DIR, "poll.log")
 
-WAIT_QUIET_S  = 10 * 60     # liveness must be still this long for "waiting on user"
-STALL_QUIET_S = 40 * 60     # ... and this long for "stall"
+STALL_QUIET_S = 40 * 60     # liveness must be still this long for "stall"
+                            # (WAIT_QUIET_S, the 10 min for "waiting on user",
+                            #  is shared with status_check.sh via watch_lib)
 
 NONE, FINISHED, WAITING, STALL, GONE, TRIPWIRE, ERROR = 0, 10, 11, 12, 13, 14, 2
 TERMINAL = {FINISHED, GONE, ERROR}
@@ -98,33 +101,6 @@ def save_state(st):
     with open(tmp, "w") as fh:
         json.dump(st, fh, indent=2, sort_keys=True)
     os.replace(tmp, STATE)
-
-
-QUESTION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
-LIMIT_RE = re.compile(
-    r"usage limit|rate.?limit|quota exceeded|resets? at \d|"
-    r"upgrade to increase|limit will reset", re.I)
-
-
-def asks_question(entry):
-    if entry.get("type") != "assistant":
-        return False, ""
-    content = (entry.get("message") or {}).get("content")
-    if not isinstance(content, list):
-        return False, ""
-    texts = []
-    for b in content:
-        if b.get("type") == "tool_use" and b.get("name") in QUESTION_TOOLS:
-            return True, "tool_use %s" % b.get("name")
-        if b.get("type") == "text":
-            texts.append(b.get("text", ""))
-    body = "\n".join(texts).strip()
-    if not body:
-        return False, ""
-    tail = body[-400:]
-    if "?" in tail.split("\n")[-1] or tail.rstrip().endswith("?"):
-        return True, "trailing question mark"
-    return False, ""
 
 
 def movement(before, after):
@@ -299,17 +275,24 @@ def main():
         _, body, _ = git("log", "-1", "--format=%b", sha)
         _, files, _ = git("show", "--name-only", "--format=", sha)
         fl = [f for f in files.splitlines() if f.strip()]
-        blob = (subj + "\n" + body)
+        # Rule (a): only a declaration counts, never a prose citation.  Every
+        # batch-id test below is built on it - including the memo rule, which
+        # used to scan the whole subject+body for `\bF1\b`.  That was the same
+        # mistake as the pre-477fe9b tripwire one paragraph later: a batch
+        # commit that *cites* the memo ("F1 decided the envelope question")
+        # while legitimately touching spanweave/ tripped it, and the memo rule
+        # guards a halt point, so its false positives are the expensive kind.
+        declared = declared_batches(subj, body)
         if any(f == "WORKPLAN.md" for f in fl) and not subj.startswith("plan:"):
             hits.append((sha, "touches WORKPLAN.md but subject does not start with 'plan:'"))
-        if any(f.startswith("spanweave/") for f in fl) and re.search(r"\bF1\b", blob):
-            hits.append((sha, "touches spanweave/ while its body names batch F1 (memo-only batch)"))
+        memo_declared = [b for b in declared if b in MEMO]
+        if any(f.startswith("spanweave/") for f in fl) and memo_declared:
+            hits.append((sha, "touches spanweave/ while declaring memo-only batch(es) %s"
+                              % ", ".join(memo_declared)))
         if any(f == "tests/serialized_shape.json" for f in fl) \
                 and "serialized_shape" not in body:
             hits.append((sha, "touches tests/serialized_shape.json without mentioning "
                               "serialized_shape in the body"))
-        # Rule (a): only a declaration counts, never a prose citation.
-        declared = declared_batches(subj, body)
         outside = [b for b in declared if b not in BATCHES]
         if outside:
             hits.append((sha, "declares batch(es) outside the run-%d list: %s"
@@ -390,11 +373,7 @@ def main():
     # Non-terminal, reported once until liveness moves again.
     subs = substantive(entries)
     q, why = (asks_question(subs[-1]) if subs else (False, ""))
-    limit_hit = None
-    for e in entries[-30:]:
-        m = LIMIT_RE.search(json.dumps(e))
-        if m:
-            limit_hit = (e.get("timestamp"), m.group(0))
+    limit_hit = limit_notice(entries)
     quiet = (now - live) if live else 0
     if (q or limit_hit) and quiet >= WAIT_QUIET_S and not st.get("waiting"):
         L = []

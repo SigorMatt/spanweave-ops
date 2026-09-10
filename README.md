@@ -16,14 +16,15 @@ behaviour contract; this file is how to run it.
 | `watch_loop.sh` | Arming path in a **plain terminal**. Re-invokes `watch_run.sh` forever, everything to the terminal. Stops on a terminal trigger. |
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 50 cases over throwaway fixtures. Proves both rules and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 105 cases over throwaway fixtures. Proves both rules, the verdict vocabulary and every dedup path. Touches neither the real repo nor the real transcript directory. |
 
 ## Invocations
 
 Status, right now:
 
 ```bash
-~/spanweave-ops/status_check.sh --run 2 --batches "A5 A6 A7 A8 B3 A9 C3 D2 H2 G5 E2 E3 E4 F1 F2 G4"
+~/spanweave-ops/status_check.sh --run 3 --batches "R1 R2 R4 R6 R5 R3 R7" \
+  --memo "R3" --base fcc842d
 ```
 
 Arm — **Monitor path** (the one in use; survives the host's low-memory guard
@@ -56,16 +57,47 @@ pgrep -af claude                                   # note the new PID set
   --pids "<the new set>"
 ```
 
-The derivation follows the resumed session on its own as long as its first
-prompt says `Resume WORKPLAN.md` or `WORKPLAN.md run 2`; if it does not, pass
-`SPANWEAVE_PINNED=<uuid>.jsonl`. To start the tripwire from scratch instead,
-`rm state/watch_state.json` first.
+The derivation follows the resumed session on its own as long as its prompt
+says `Resume WORKPLAN.md`, or mentions `WORKPLAN.md` and names the run — the
+run number need not be adjacent to the filename, so being pointed at a handover
+file (`Apply ~/Downloads/run3-2026-09-11.md … recreate WORKPLAN.md …`) is
+enough. If it does not, pass `SPANWEAVE_PINNED=<uuid>.jsonl`. To start the
+tripwire from scratch instead, `rm state/watch_state.json` first.
+
+Pass `--memo "R3"` to name the run's memo-only batches — the ones that must end
+`awaiting decision` and never touch `spanweave/`. It defaults to run 2's `F1`.
 
 Self-test:
 
 ```bash
 ~/spanweave-ops/selftest.sh          # exit 0 = all cases pass
 ```
+
+## What `status_check.sh` says
+
+The last line of the report is a **verdict**, and it is one of exactly six
+values. Nothing else appears on that line, so a caller can match it exactly;
+the evidence it was derived from is printed underneath it.
+
+| verdict | means | derived from |
+|---|---|---|
+| `not started` | the run has not begun | no builder transcript derived for this run, **and** no commit since base declares one of its batches |
+| `applying plan` | a builder is live but no batch has moved | a transcript derived *and* liveness under 10 min, with nothing declared — typically the plan file itself being written |
+| `underway: batch <ID>` | a batch is being worked | a row says something other than `todo`/stopped, else the first still-open row once any batch has been declared by a commit |
+| `waiting on user` | blocked on a human | the last assistant entry asks a question, or a usage/rate-limit notice appears, **and** liveness has been still ≥ 10 min |
+| `finished` | the run is done | every batch stopped (or `WORKPLAN.md` gone) **and** HEAD is pushed |
+| `unclear` | the evidence does not settle it | an unreadable plan; a plan with no row for any batch of this run while some are committed; every batch stopped but HEAD unpushed with nothing live; a derived builder that is quiet and has declared nothing |
+
+`waiting on user` outranks everything except a finished, pushed run: a session
+blocked on a human is not advancing, whatever the rows say.
+
+**Why a closed vocabulary.** The old last line was free-form, and on 2026-09-10
+it read `ALIVE (liveness 5.7 min ago) | run 3: 0/7 batches stopped, active: R1,
+R2, R4, R6, R5, R3, R7`. Every clause was true and the line as a whole was
+false: the liveness was a `/clear` typed into the *finished* run-2 session, and
+the seven "active" batches were seven rows the parser could not see, because
+batch ids were matched as `[A-H]\d+` and run 3's are `R1`–`R7`. A reader
+skimming that line would have concluded run 3 was underway. It had not started.
 
 ## Per-trigger policy
 

@@ -114,9 +114,48 @@ transcripts, including the watching session's own, and builder transcripts from
 The derivation takes the run number. A candidate is a top-level `*.jsonl` in
 that directory whose most recent `"lastPrompt"`:
 
-1. mentions `WORKPLAN.md run N` or `Resume WORKPLAN.md` (case-insensitive), **and**
-2. names no run number other than `N` — any `run <digits>` in the prompt, **and**
-3. is not one of this tooling's own session files (`SPANWEAVE_SELF`, a list).
+1. does not open by announcing itself as a reviewer or a watcher, **and**
+2. says `Resume WORKPLAN.md`, or mentions `WORKPLAN.md` *and* names run `N`
+   in an operative form — `run N`, `runN`, `run #N` — anywhere in the prompt,
+   **and**
+3. does not name a different run *without* also naming `N`, **and**
+4. is neither this session's own transcript (`CLAUDE_CODE_SESSION_ID`) nor a
+   known past watcher/aux one (`SPANWEAVE_SELF`).
+
+**Why 1 exists.** Aux sessions talk about the plan and name the run too, so
+once rule 2 stopped demanding the literal phrase they became candidates: a
+run-2 check derived onto `Cold review of run 2 of the spanweave audit series`,
+an aux reviewer, in preference to the builder. What separates them is position,
+not vocabulary — an aux prompt says what it is in its opening words, while run
+3's *builder* prompt contains "review" 150 characters in — so only the first 80
+characters are tested.
+
+**Why 2 is not the literal phrase.** Run 3's builder was started with `Apply
+~/Downloads/run3-2026-09-11.md with one plan-only sub-agent (recreate
+WORKPLAN.md from git show c79cbc5:WORKPLAN.md …)`. That is unmistakably a run-3
+builder and it matched neither `WORKPLAN.md run 3` nor `Resume WORKPLAN.md`, so
+the watch fell back to the pin — the *run-2* transcript — and reported a
+finished session's liveness as though run 3 were alive. Being about the plan
+and being about run `N` are two conditions, and nothing requires them to be
+adjacent.
+
+**Why 3 is not "names no other run".** The same run-3 prompt ends `single
+commit plan: reopen for run 3 -- run-2 review findings`. It names run 3 and
+*cites* run 2, and the old absolute test threw it out for the citation — the
+same citation-versus-declaration mistake rule (a) exists to correct. A prompt
+that names `N` is about `N`, whatever else it refers to. The hyphenated
+`run-2` is treated as citation-only for rule 2 as well: in this corpus that
+form is always adjectival (`run-2 review findings`, `run-1 concerns`), whereas
+an operative reference is spaced or bare, including the `run3-…` of a handover
+filename where the digit attaches to the word.
+
+**Why 4 is not just a list.** `SPANWEAVE_SELF` is written before the session
+that uses it exists, so it can never contain the running watcher — and rule 2's
+loosening makes self-derivation *more* likely, not less, because a watcher is
+told about `WORKPLAN.md` and about the run number too. The live session is
+excluded by `CLAUDE_CODE_SESSION_ID` instead; the static list now covers only
+watcher and aux sessions from earlier. `selftest.sh` asserts both halves,
+including that without the session id the watcher does derive onto itself.
 
 Among candidates: the newest **`<stem>/subagents/` directory mtime** wins, then
 the transcript's own mtime, then the name. (That is the *derivation* tiebreak;
@@ -209,9 +248,26 @@ earlier batches (`A3's rule`, `C1's sentence is fixed by C3`), so the old rule
 was a false positive generator, not a tripwire. `selftest.sh` runs the real
 `477fe9b` message through it.
 
-*Still prose-matched:* the **F1** rule above scans the whole body for `\bF1\b`.
-That one is deliberately broad — it guards a halt point, and a false positive
-there is cheap now that a tripwire no longer stops the watch.
+*The memo rule uses the same test.* It used to scan the whole body for
+`\bF1\b`, on the reasoning that a false positive is cheap. It is not: a batch
+commit that legitimately touches `spanweave/` while *citing* the memo ("R3 is
+the memo that will decide stated units; this commit does not pre-empt it")
+tripped it, which is the pre-`477fe9b` mistake exactly. It now fires only when
+a commit **declares** a memo batch. The memo set is per-run and passed with
+`--memo` (run 2: `F1`; run 3: `R3`); it defaults to `F1`.
+
+*Batch ids are prefix-agnostic.* `BATCH_ID` was `[A-H]\d+`, which covered run
+2's ids and none of run 3's `R1`–`R7`. Every run-3 row read as `<row missing>`,
+every run-3 declaration was invisible to the tripwire, and the status report's
+`0/7 batches stopped, active: <all seven>` was a default rather than an
+observation. It is now `[A-Z]\d+`: which letter a plan uses is the plan's
+business.
+
+*Row statuses are prefix-matched.* `is_stopped` tested `done` and `dropped` by
+equality while `awaiting` and `blocked` were prefix-matched. The plan does not
+write a bare `done` — it writes ``done (`0e4262e`)`` — so once run 3's rows
+became visible at all, every completed batch still read as active. All four are
+prefix-matched now.
 
 **finished** *(terminal)* — `origin/audit-fixes` moved past the base, **and**
 local HEAD equals it, **and** no listed batch is `todo` or `in progress`.
@@ -266,14 +322,26 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 50 cases, fixtures only, `~/git/spanweave` and the real
-transcript directory never touched. It covers: the eight rule-(a) shapes
-including the real `477fe9b` message; the rule-(b) derivation from both run
-directions, both tiebreaks, self-exclusion and the pin fallback; the `95360def`
-drift from both pins; and every dedup path — tripwire once-per-sha, waiting
+`./selftest.sh` — 105 cases, fixtures only, `~/git/spanweave` and the real
+transcript directory never touched. It covers: the rule-(a) shapes including
+the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
+derivation from both run directions, both tiebreaks, the pin fallback, the aux
+and watcher prompts that must not be builders, and self-exclusion — including
+the case that *without* `CLAUDE_CODE_SESSION_ID` the watcher derives onto
+itself; the `95360def` drift from both pins; the run-3 row shapes, with an
+escaped pipe in the row and a sha on the status; the memo rule firing on a
+declaration and not on a citation; all six verdict values, including that
+`waiting on user` outranks an in-progress row but not a finished, pushed run;
+and every dedup path — tripwire once-per-sha, waiting
 once-then-`RESUMED`-then-again, stall once-then-40-min-then-again, and both
 terminal exits; and the series-close cases, where `WORKPLAN.md` is deleted
 staged, then committed, then reached `finished` with the plan closed.
+
+The dedup fixtures pin their timestamps once rather than recomputing
+`touch -d '-20 min'` per call. Recomputing made the fixture lift its own
+suppression before the poll meant to observe it — `movement()` reads liveness
+advancing by >0.5 s as a resume — which failed roughly half of runs on this
+tree and on the tree before these fixes.
 
 Earlier, 2026-09-10, against a throwaway fixture repo: exit `0` on a quiet poll
 and each trigger's evidence block rendering correctly.
