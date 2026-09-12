@@ -704,6 +704,133 @@ grep -q "declaring memo-only batch(es) R3" "$TMP/last_run4.txt" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "an operator-given --base outranks the baseline a previous run persisted"
+# ---------------------------------------------------------------------------
+# Run 5's first poll scanned `fcc842d..HEAD` instead of the `b091904..HEAD` it
+# was given: `last_seen_head` from run 4 was consulted first, so every commit
+# between the two was never examined.  The fixture reproduces exactly that
+# shape - an offending commit sitting between the given base and the stale
+# persisted head - and pins both halves of the rule.
+R5D="$TMP/repo5"; mkdir -p "$R5D"
+git -C "$R5D" init -q -b audit-fixes
+git -C "$R5D" config user.email t@example.invalid
+git -C "$R5D" config user.name Selftest
+cat > "$R5D/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| S1 | thing | todo | 20 |
+| S2 | thing | todo | 15 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$R5D" add -A && git -C "$R5D" commit -qm "base"
+BASE5="$(git -C "$R5D" rev-parse HEAD)"
+git init -q --bare "$TMP/remote5.git"
+git -C "$R5D" remote add origin "$TMP/remote5.git"
+git -C "$R5D" push -q origin audit-fixes
+
+# The commit the stale baseline hides: offending, and between base and stale.
+git -C "$R5D" commit -q --allow-empty -F - <<'MSG'
+reader: something before the stale baseline
+
+Batch Z9 of WORKPLAN.md. Not in the run-5 list.
+MSG
+STALE5="$(git -C "$R5D" rev-parse HEAD)"      # the run-4-tail analogue
+git -C "$R5D" commit -q --allow-empty -m "chore: after the stale baseline"
+
+TD5="$TMP/tdir5"; mkdir -p "$TD5"; ST5="$TMP/state5"; mkdir -p "$ST5"
+printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 5"}\n' > "$TD5/55555555.jsonl"
+
+seed5() {  # persist a baseline that is AHEAD of the base the operator gives
+  python3 - "$ST5/watch_state.json" "$STALE5" <<'PYSEED'
+import json, sys
+json.dump({"last_seen_head": sys.argv[2], "reported_commits": [],
+           "reported_conditions": {}, "run": 5},
+          open(sys.argv[1], "w"), indent=2, sort_keys=True)
+PYSEED
+}
+
+run5() {  # run5 [anything] -> "<exit>|<event kinds>"; with no argument, no --base
+  local out rc
+  out="$(SPANWEAVE_STATE_DIR="$ST5" SPANWEAVE_REPO="$R5D" SPANWEAVE_TDIR="$TD5" \
+         SPANWEAVE_PINNED="55555555.jsonl" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+         SPANWEAVE_BRANCH=audit-fixes SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="S1 S2" \
+         SPANWEAVE_MEMO="" \
+         "$OPS_DIR/watch_run.sh" --once --run 5 ${1:+--base "$BASE5"} 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" > "$TMP/last_run5.txt"
+  printf '%s|%s' "$rc" \
+    "$(printf '%s\n' "$out" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)"
+}
+
+# (a) The control: no --base, so the persisted baseline is all there is, and
+#     the commit behind it stays unexamined.  This is the bug, held in place so
+#     the next case is known to be testing the fix and not the fixture.
+seed5
+check "with no --base, a stale persisted baseline hides the commit behind it" \
+  "$(run5)" "0|"
+
+# (b) The rule: the same stale baseline, the same commit, one --base flag.
+seed5
+check "an explicit --base re-scans from the base and finds it" "$(run5 base)" "0|tripwire"
+grep -q "outside the run-5 list: Z9" "$TMP/last_run5.txt" \
+  && ok "the block names the batch the stale baseline hid" \
+  || bad "the block does not name the batch the stale baseline hid"
+grep -q "first time this poll (${BASE5:0:7}\.\.HEAD)" "$TMP/last_run5.txt" \
+  && ok "the evidence header names the given base, not the persisted head" \
+  || bad "the evidence header does not name the given base"
+
+# (c) Re-scanning from the base every poll must not re-report: the widened
+#     range is deduped by `reported_commits`, exactly as the narrow one was.
+check "a second --base poll re-scans the same range and reports nothing twice" \
+  "$(run5 base)" "0|"
+
+# (d) An empty SPANWEAVE_BASE is not an operator statement; it must fall back
+#     to the persisted baseline rather than to `DEF_BASE`, which belongs to a
+#     run that ended long ago.
+seed5
+out5="$(SPANWEAVE_STATE_DIR="$ST5" SPANWEAVE_REPO="$R5D" SPANWEAVE_TDIR="$TD5" \
+        SPANWEAVE_PINNED="55555555.jsonl" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+        SPANWEAVE_BASE="" SPANWEAVE_BRANCH=audit-fixes SPANWEAVE_PIDS="" \
+        SPANWEAVE_BATCHES="S1 S2" SPANWEAVE_MEMO="" \
+        "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+check "an empty SPANWEAVE_BASE does not count as an operator-given base" \
+  "$(printf '%s\n' "$out5" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)" ""
+
+python3 - <<'PYCFG'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, DEF_BASE
+
+cases = [
+    ("a given base is explicit",      {"SPANWEAVE_BASE": "b091904"},   "b091904", True),
+    ("a padded base is stripped",     {"SPANWEAVE_BASE": "  b091904 "},"b091904", True),
+    ("an empty base is not explicit", {"SPANWEAVE_BASE": ""},          DEF_BASE,  False),
+    ("an absent base is not explicit", {},                             DEF_BASE,  False),
+]
+bad = 0
+for name, env, want_base, want_expl in cases:
+    os.environ.pop("SPANWEAVE_BASE", None)
+    os.environ.update(env)
+    cfg = config()
+    got, want = (cfg["base"], cfg["base_explicit"]), (want_base, want_expl)
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+os.environ.pop("SPANWEAVE_BASE", None)
+sys.exit(bad)
+PYCFG
+[ $? -eq 0 ] || fail=1
+
+# ---------------------------------------------------------------------------
+echo
 echo "verdict - one of exactly six values, from evidence alone"
 # ---------------------------------------------------------------------------
 python3 - <<'PY'

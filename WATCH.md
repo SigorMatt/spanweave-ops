@@ -219,8 +219,12 @@ lines is read as a secondary signal (`1` means a batch sub-agent is outstanding)
 Evaluated in this order. The non-terminal ones do not stop the poll; a poll can
 therefore report a tripwire *and* a stall.
 
-**tripwire** — checked against every local commit not yet reported
-(`last_seen_head..HEAD`, seeded at the `--base` sha, minus `reported_commits`):
+**tripwire** — checked against every local commit not yet reported, minus
+`reported_commits`. The range starts at the `--base` sha whenever one is given:
+an operator-given base is a statement about where *this* run starts and
+outranks the `last_seen_head` a previous run persisted, so re-basing a run no
+longer needs the state file deleted. With no `--base`, the range is
+`last_seen_head..HEAD` as before:
 
 - subject does not start with `plan:` but the commit touches `WORKPLAN.md`
 - touches `spanweave/` while the body names batch **F1** (F1 is memo-only; it
@@ -316,13 +320,15 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
   once-ever list, capped at 500), `reported_conditions` (level-triggered
   tripwire conditions, currently only "wrong branch"), and `waiting` / `stall`
   suppression records (each holds the four signal values at fire time plus
-  `fired_at`). Delete the file to re-baseline everything at `--base`.
+  `fired_at`). `last_seen_head` is only consulted when no `--base` is given;
+  pass `--base` to re-baseline, or delete the file to clear the dedup lists
+  too.
 - `poll.log` — one banner line per poll, plus the full text of every event.
 - `last_evidence.txt` — the most recent evidence block.
 
 ## Verified
 
-`./selftest.sh` — 105 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 115 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux

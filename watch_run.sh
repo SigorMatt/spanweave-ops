@@ -67,6 +67,7 @@ REPO   = CFG["repo"]
 TDIR   = CFG["tdir"]
 PINNED = CFG["pinned"]
 BASE   = CFG["base"]
+BASE_EXPLICIT = CFG["base_explicit"]
 BRANCH = CFG["branch"]
 RUN    = CFG["run"]
 PIDSET = CFG["pids"]
@@ -263,7 +264,19 @@ def main():
     reported = set(st.get("reported_commits") or [])
     conditions = dict(st.get("reported_conditions") or {})
 
-    last_seen = st.get("last_seen_head") or basefull or BASE
+    # An operator-given `--base` is a statement about where *this* run starts,
+    # and it outranks whatever baseline a previous run left in
+    # `watch_state.json`.  Run 5's first poll scanned `fcc842d..HEAD` - the tail
+    # of run 4 - instead of the `b091904..HEAD` it was given, because the
+    # persisted `last_seen_head` was consulted first and silently won; every
+    # commit between the two went past the tripwire unexamined.  The persisted
+    # value is a convenience for the no-flag case, never evidence about a run
+    # the operator has just redefined.  Re-scanning from the base on every poll
+    # is safe and idempotent: `reported_commits` still reports each sha once.
+    if BASE_EXPLICIT and basefull:
+        last_seen = basefull
+    else:
+        last_seen = st.get("last_seen_head") or basefull or BASE
     rc_range, newshas, _ = git("log", "--format=%H", "%s..HEAD" % last_seen)
     new_commits = [s for s in newshas.splitlines() if s.strip()] if rc_range == 0 else []
     new_commits.reverse()

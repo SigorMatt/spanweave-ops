@@ -50,7 +50,13 @@ def config():
         "pinned":  os.environ.get("SPANWEAVE_PINNED", DEF_PINNED),
         "self":    [n for n in os.environ.get("SPANWEAVE_SELF", DEF_SELF)
                     .replace(",", " ").split() if n],
-        "base":    os.environ.get("SPANWEAVE_BASE", DEF_BASE),
+        "base":    (os.environ.get("SPANWEAVE_BASE") or "").strip() or DEF_BASE,
+        # Whether the operator actually named a base, as opposed to inheriting
+        # `DEF_BASE` - which is a *previous* run's start and is wrong for every
+        # run after it.  The tripwire needs the distinction: an operator-given
+        # base outranks the baseline a previous run persisted, a defaulted one
+        # must not (see `watch_run.sh`, TRIPWIRE).
+        "base_explicit": bool((os.environ.get("SPANWEAVE_BASE") or "").strip()),
         "branch":  os.environ.get("SPANWEAVE_BRANCH", DEF_BRANCH),
         "run":     int(os.environ.get("SPANWEAVE_RUN", DEF_RUN)),
         "pids":    [int(x) for x in os.environ.get("SPANWEAVE_PIDS", DEF_PIDS)
