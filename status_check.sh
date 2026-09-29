@@ -264,9 +264,18 @@ asks, asks_why = (asks_question(subs[-1]) if subs else (False, ""))
 limit_hit = limit_notice(entries)
 quiet_s = (now - live) if live else None
 is_pushed = bool(origin) and origin == headsha
+# The evidence for "a batch is in flight but nothing has landed": the run's
+# plan commit exists, a sub-agent is working, and the tree is dirty.  Untracked
+# paths count as uncommitted - a batch in progress routinely adds a new test
+# file before it adds anything else.
+head_past_base = bool([x for x in shas.splitlines() if x.strip()])
+sub_quiet_s = (now - s_m) if s_m else None
+dirty_paths = [x for x in statusshort.splitlines() if x.strip()]
 
 v, why = verdict(statuses, plan_src, BATCHES, how, quiet_s, is_pushed,
-                 asks, bool(limit_hit), declared_since_base)
+                 asks, bool(limit_hit), declared_since_base,
+                 head_past_base=head_past_base, pending=pending,
+                 sub_quiet_s=sub_quiet_s, dirty=bool(dirty_paths))
 
 if is_pushed:
     pushed_txt = "pushed"
@@ -286,6 +295,12 @@ print("  batches   : run %d: %d/%d stopped, active: %s"
       % (RUN, len(BATCHES) - len(active), len(BATCHES),
          ", ".join(active) if active else "(none)"))
 print("  declared  : %s" % (", ".join(declared_since_base) or "(none since %s)" % BASE))
+print("  in flight : pendingBackgroundAgentCount=%s | subagents/ %s | tree %s"
+      % (pending,
+         ("%s ago" % age(s_m, now)) if s_m else "n/a",
+         ("%d uncommitted path(s): %s" % (len(dirty_paths),
+                                          " ".join(p.strip() for p in dirty_paths[:4])))
+         if dirty_paths else "clean"))
 print("  head      : %s %s | branch %s | plan rows from %s"
       % (headshort, pushed_txt, curbranch, plan_src))
 if missing_pids:

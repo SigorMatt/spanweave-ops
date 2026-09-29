@@ -65,7 +65,7 @@ while :; do
 import json, os, re, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (WAIT_QUIET_S, age, asks_question, claude_processes,
+from watch_lib import (STALL_QUIET_S, WAIT_QUIET_S, age, asks_question, claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, render, resume_note_tail,
@@ -89,9 +89,9 @@ STATE     = os.path.join(STATE_DIR, "watch_state.json")
 EVIDENCE  = os.path.join(STATE_DIR, "last_evidence.txt")
 LOG       = os.path.join(STATE_DIR, "poll.log")
 
-STALL_QUIET_S = 40 * 60     # liveness must be still this long for "stall"
-                            # (WAIT_QUIET_S, the 10 min for "waiting on user",
-                            #  is shared with status_check.sh via watch_lib)
+# STALL_QUIET_S (40 min, "stall") and WAIT_QUIET_S (10 min, "waiting on user")
+# both come from watch_lib, so this watch and the one-shot report cannot drift
+# apart on either threshold.
 
 NONE, FINISHED, WAITING, STALL, GONE, TRIPWIRE, ERROR = 0, 10, 11, 12, 13, 14, 2
 TERMINAL = {FINISHED, GONE, ERROR}

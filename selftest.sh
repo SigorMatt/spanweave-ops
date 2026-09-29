@@ -1093,6 +1093,125 @@ sys.exit(bad)
 PY
 [ $? -eq 0 ] || fail=1
 
+# ---------------------------------------------------------------------------
+echo
+echo "underway - a batch that has landed (a), and one still in flight (b)"
+# ---------------------------------------------------------------------------
+# On 2026-09-30 a run-2 check said `applying plan` while batch L3's sub-agent
+# was three edits into `spanweave/ids.py`.  Every clause was true - plan commit
+# pushed, nothing declared, L3's row still `todo` - and the line as a whole
+# said the run had not got going.  The builder marks a row `done` only AFTER
+# the batch lands, so between the first dispatch and the first commit the rows
+# and the log are both silent; the only evidence is a live sub-agent and a
+# dirty tree.  That window is underway, not applying plan.
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import STALL_QUIET_S, first_todo, verdict
+
+# The real run-2 shape: L4 and L5 are stopped by dependency markers, so the
+# run's order matters - the answer is L3, and L6 is the next one after it.
+B = ["L3", "L4", "L5", "L6"]
+ROWS = {"L3": "todo", "L4": "awaiting L3", "L5": "awaiting L4", "L6": "todo"}
+
+def V(**kw):
+    a = dict(statuses=ROWS, source="worktree", batches=B, how="derived",
+             quiet_s=60, pushed=True, asks=False, limit_hit=False,
+             declared_since_base=[], head_past_base=True, pending=None,
+             sub_quiet_s=None, dirty=False)
+    a.update(kw)
+    return verdict(a["statuses"], a["source"], a["batches"], a["how"],
+                   a["quiet_s"], a["pushed"], a["asks"], a["limit_hit"],
+                   a["declared_since_base"], head_past_base=a["head_past_base"],
+                   pending=a["pending"], sub_quiet_s=a["sub_quiet_s"],
+                   dirty=a["dirty"])[0]
+
+INFLIGHT = "underway: batch L3 (in flight, uncommitted)"
+cases = [
+    # -- (a) a commit since base declared a batch of this run ----------------
+    ("(a) a declared batch is underway even with every row still todo",
+     V(declared_since_base=["L3"]), "underway: batch L3"),
+    ("(a) holds without any sub-agent or dirty tree",
+     V(declared_since_base=["L3"], pending=0, sub_quiet_s=None, dirty=False),
+     "underway: batch L3"),
+    ("(a) names the first row still open, not the one declared",
+     V(statuses=dict(ROWS, L3="done (`abc1234`)"), declared_since_base=["L3"]),
+     "underway: batch L6"),
+
+    # -- (b) pushed plan + live sub-agent + dirty tree -----------------------
+    ("(b) the exact 2026-09-30 state is underway, not applying plan",
+     V(pending=1, dirty=True), INFLIGHT),
+    ("(b) a subagents/ file inside the stall window carries it without pending",
+     V(pending=0, sub_quiet_s=5 * 60, dirty=True), INFLIGHT),
+    ("(b) pending alone carries it with no subagents/ mtime at all",
+     V(pending=2, sub_quiet_s=None, dirty=True), INFLIGHT),
+    ("(b) names the first TODO batch in the run's order, skipping the blocked",
+     V(statuses=dict(ROWS, L3="done (`abc1234`)"), pending=1, dirty=True),
+     "underway: batch L6 (in flight, uncommitted)"),
+
+    # -- each conjunct of (b) is load-bearing --------------------------------
+    ("a clean tree is not a batch in flight",
+     V(pending=1, dirty=False), "unclear"),
+    ("a dirty tree with no sub-agent is not a batch in flight",
+     V(pending=0, sub_quiet_s=None, dirty=True), "unclear"),
+    ("a sub-agent quiet past the stall window is not in flight",
+     V(pending=0, sub_quiet_s=STALL_QUIET_S + 60, dirty=True), "unclear"),
+    ("an unpushed plan commit is applying plan, and outranks in-flight",
+     V(pushed=False, pending=1, dirty=True), "applying plan"),
+    ("no plan commit at all is applying plan, however busy the tree",
+     V(head_past_base=False, pending=1, dirty=True), "applying plan"),
+
+    # -- `applying plan` is now ONLY the two plan-commit states --------------
+    ("a live builder with the plan pushed and nothing moving is not 'applying plan'",
+     V(pending=0, dirty=False), "unclear"),
+    ("a live builder with the plan unpushed is applying plan",
+     V(pushed=False), "applying plan"),
+    ("a live builder with no plan commit yet is applying plan",
+     V(head_past_base=False), "applying plan"),
+
+    # -- the rules that already outranked underway still do ------------------
+    ("a row that says in progress still wins over in-flight",
+     V(statuses=dict(ROWS, L3="in progress"), pending=1, dirty=True),
+     "underway: batch L3"),
+    ("waiting on user still outranks a batch in flight",
+     V(pending=1, dirty=True, asks=True, quiet_s=700), "waiting on user"),
+    ("a finished, pushed run is not in flight whatever the tree looks like",
+     V(statuses={b: "done (`abc1234`)" for b in B}, pending=1, dirty=True),
+     "finished"),
+]
+bad = 0
+for name, got, want in cases:
+    # The qualified form is still `underway`, not a seventh word: a caller
+    # matching the vocabulary must not have to learn a new prefix.
+    ok_v = (got in {"not started", "applying plan", "waiting on user",
+                    "finished", "unclear"}
+            or got.startswith("underway: batch "))
+    if got == want and ok_v:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r%s"
+              % (name, got, want, "" if ok_v else "  (outside the vocabulary!)"))
+        bad = 1
+
+for name, got, want in [
+    ("first_todo takes the run's order, not the alphabet",
+     first_todo({"L3": "done (`a`)", "L4": "todo", "L6": "todo"}, ["L6", "L3", "L4"]), "L6"),
+    ("first_todo skips a row that is already running",
+     first_todo({"L3": "in progress", "L6": "todo"}, ["L3", "L6"]), "L6"),
+    ("first_todo skips a dependency marker",
+     first_todo({"L3": "done (`a`)", "L4": "awaiting L3", "L6": "todo"},
+                ["L3", "L4", "L6"]), "L6"),
+    ("first_todo has no answer when every row is stopped",
+     first_todo({"L3": "done (`a`)"}, ["L3"]), None),
+]:
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
 exit "$fail"

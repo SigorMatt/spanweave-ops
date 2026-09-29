@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 133 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 155 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — and every dedup path. Touches neither the real repo nor the real transcript directory. |
 
 ## What you have to pass, and what you do not
 
@@ -96,21 +96,44 @@ Self-test:
 
 ## What `status_check.sh` says
 
-The last line of the report is a **verdict**, and it is one of exactly six
-values. Nothing else appears on that line, so a caller can match it exactly;
-the evidence it was derived from is printed underneath it.
+The last line of the report is a **verdict**, drawn from a closed vocabulary
+of six values — one of which, `underway`, takes a qualifier saying which
+evidence carried it. Nothing else appears on that line, so a caller can match
+it exactly; the evidence it was derived from is printed underneath it.
 
 | verdict | means | derived from |
 |---|---|---|
 | `not started` | the run has not begun | no builder transcript derived for this run, **and** no commit since base declares one of its batches |
-| `applying plan` | a builder is live but no batch has moved | a transcript derived *and* liveness under 10 min, with nothing declared — typically the plan file itself being written |
-| `underway: batch <ID>` | a batch is being worked | a row says something other than `todo`/stopped, else the first still-open row once any batch has been declared by a commit |
+| `applying plan` | the run's plan commit is still being made | a derived transcript with liveness under 10 min, **and** the plan commit is absent or not pushed. That is *all* it means now |
+| `underway: batch <ID>` | a batch is being worked, and something has landed | a row says something other than `todo`/stopped, else the first still-open row once a commit since base has **declared** one of the run's batches |
+| `underway: batch <ID> (in flight, uncommitted)` | a batch is being worked and nothing has landed yet | the plan commit is pushed, **and** a builder sub-agent is live (`pendingBackgroundAgentCount ≥ 1`, or a `subagents/` file touched within the 40-min stall window), **and** the tree has uncommitted changes. `<ID>` is the first `todo` batch in the run's section-2 execution order |
 | `waiting on user` | blocked on a human | the last assistant entry asks a question, or a usage/rate-limit notice appears, **and** liveness has been still ≥ 10 min |
 | `finished` | the run is done | every batch stopped (or `WORKPLAN.md` gone) **and** HEAD is pushed |
-| `unclear` | the evidence does not settle it | an unreadable plan; a plan with no row for any batch of this run while some are committed; every batch stopped but HEAD unpushed with nothing live; a derived builder that is quiet and has declared nothing |
+| `unclear` | the evidence does not settle it | an unreadable plan; a plan with no row for any batch of this run while some are committed; every batch stopped but HEAD unpushed with nothing live; a quiet derived builder that has declared nothing; a live one with the plan pushed, no row moved and nothing in flight |
+
+The qualified form is still `underway`, not a seventh word — it begins
+`underway: batch `, which is what a caller matches on. The parenthetical is
+there because it is a **weaker** claim than the unqualified one: no commit has
+declared the batch, so the evidence is activity, not a result.
 
 `waiting on user` outranks everything except a finished, pushed run: a session
-blocked on a human is not advancing, whatever the rows say.
+blocked on a human is not advancing, whatever the rows say. A row that says
+`in progress` outranks the in-flight reading, and so does a declared commit.
+
+### Why in-flight is its own answer
+
+On 2026-09-30 a run-2 check reported `applying plan` while batch L3's sub-agent
+was three edits into `spanweave/ids.py`. Every clause was true — the plan
+commit was pushed, no commit had declared L3, its row still said `todo` — and
+the line as a whole said the run had not got going. It had.
+
+The builder marks a row `done` only **after** a batch lands, so between a run's
+first dispatch and its first commit the rows and the log are both silent. The
+only evidence in that window is a live sub-agent and a dirty tree, and all
+three conjuncts are load-bearing: an unpushed plan commit means the plan is
+still being applied; a dirty tree alone is any stray edit or an untracked
+scratch directory; a live sub-agent alone may be a plan-only helper that never
+touches the tree.
 
 **Why a closed vocabulary.** The old last line was free-form, and on 2026-09-10
 it read `ALIVE (liveness 5.7 min ago) | run 3: 0/7 batches stopped, active: R1,

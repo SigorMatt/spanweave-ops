@@ -383,7 +383,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 133 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 155 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -402,7 +402,11 @@ a detached HEAD, a poll with no `--branch` against a repo that is *not* on
 `audit-fixes` running clean while a given-but-wrong branch still trips the
 wire, the PID set from a synthetic `pgrep` including that the wrapper never
 matches itself, unset-versus-empty, and an empty set leaving `builder gone`
-disarmed and saying so.
+disarmed and saying so; and both branches of `underway` — a batch **declared**
+by a commit since base, and a batch **in flight** (plan commit pushed, a live
+sub-agent, a dirty tree) with each of those three conjuncts shown to be
+load-bearing, the first `todo` batch named in the run's execution order rather
+than the alphabet, and `applying plan` narrowed to the two plan-commit states.
 
 Because the branch is derived, an unset `SPANWEAVE_BRANCH` would make
 `config()` shell out to the *real* repo. `selftest.sh` exports a fixture floor

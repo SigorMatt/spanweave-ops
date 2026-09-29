@@ -52,6 +52,13 @@ DEF_MEMO   = "F1"
 # watch_run.sh so the watch and the one-shot report agree.
 WAIT_QUIET_S = 10 * 60
 
+# The stall window: nothing moving for this long, while a batch is in progress,
+# is a stall.  It lives here rather than in watch_run.sh because the verdict
+# rule uses it too - "a sub-agent file touched within the stall window" is what
+# makes a batch *in flight* rather than merely started - and the two must not
+# be allowed to drift apart.
+STALL_QUIET_S = 40 * 60
+
 
 def repo_dir():
     """The watched repo, resolved without the rest of the configuration.
@@ -646,13 +653,33 @@ def is_running(status):
 V_NOT_STARTED = "not started"
 V_APPLYING    = "applying plan"
 V_UNDERWAY    = "underway: batch %s"
+# A qualified `underway`, not a seventh word: it still starts with `underway:
+# batch `, which is what a caller matches on.  The parenthetical says which
+# evidence carried it, because "in flight, uncommitted" is a weaker claim than
+# a commit that declared the batch - nothing has landed yet.
+V_UNDERWAY_INFLIGHT = "underway: batch %s (in flight, uncommitted)"
 V_WAITING     = "waiting on user"
 V_FINISHED    = "finished"
 V_UNCLEAR     = "unclear"
 
 
+def first_todo(statuses, batches):
+    """The first batch in the run's own order that is neither stopped nor
+    already running - i.e. the one a builder would pick up next.
+
+    `batches` is the order the operator passed, which is WORKPLAN.md section
+    2's *execution* order, not section 1's listing order; run 3's was
+    `R1 R2 R4 R6 R5 R3 R7`.  So "first" here means first to be worked, which is
+    the only sense in which naming one batch out of several is useful."""
+    for b in batches:
+        if not is_stopped(statuses.get(b, "todo")) and not is_running(statuses.get(b)):
+            return b
+    return None
+
+
 def verdict(statuses, source, batches, how, quiet_s, pushed,
-            asks, limit_hit, declared_since_base):
+            asks, limit_hit, declared_since_base,
+            head_past_base=True, pending=None, sub_quiet_s=None, dirty=False):
     """-> (verdict line, one-line reason).
 
     Pure: every argument is evidence already gathered by the caller, so the
@@ -660,13 +687,28 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
 
       statuses            {batch id: status} from WORKPLAN.md section 1
       source              "worktree" | "HEAD" | "absent" | "unreadable"
-      batches             the run's batch list, in order
+      batches             the run's batch list, in section 2's execution order
       how                 "derived" | "pin (no candidate)" | "none"
       quiet_s             seconds since the newest liveness signal, or None
       pushed              HEAD == origin/<branch>
       asks / limit_hit    the two "waiting on user" signals
       declared_since_base batch ids of this run declared by a commit since base
-    """
+      head_past_base      HEAD has at least one commit since base - i.e. the
+                          run's plan commit exists at all
+      pending             last pendingBackgroundAgentCount seen, or None
+      sub_quiet_s         seconds since the newest file under `subagents/`
+      dirty               the working tree has uncommitted changes
+
+    **Why the last four exist.** On 2026-09-30 a run-2 check reported `applying
+    plan` while batch L3's sub-agent was three edits into `spanweave/ids.py`.
+    Every clause was true - the plan commit was pushed, no commit had declared
+    L3, its row still said `todo` - and the line as a whole said the run had
+    not got going.  It had.  The builder marks a row `done` only *after* the
+    batch lands, so between a run's first dispatch and its first commit there
+    is a window in which the rows and the log are both silent and the only
+    evidence is a live sub-agent and a dirty tree.  That window is `underway`,
+    not `applying plan`; `applying plan` now means only what its name says -
+    the run's plan commit is still being written or has not been pushed."""
     if statuses is None or source == "unreadable":
         return V_UNCLEAR, "WORKPLAN.md is present but cannot be read"
 
@@ -706,15 +748,51 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
     running = [b for b in batches if is_running(statuses.get(b))]
     if running:
         return V_UNDERWAY % running[0], "its row says %r" % statuses[running[0]]
+
+    # (a) A commit since base declared one of this run's batches.  The strongest
+    # evidence there is: something has landed.
     if declared_since_base:
         return (V_UNDERWAY % active[0],
                 "batch(es) %s already committed; %s is the first row still open"
                 % (", ".join(declared_since_base), active[0]))
 
-    # Nothing has moved on any batch.  The builder is either mid-setup or has
-    # not been started at all, and the transcript is what tells them apart.
+    # (b) Nothing has landed and no row has moved, but the run's plan commit is
+    # pushed and a builder sub-agent is working in a dirty tree.  That is a
+    # batch in flight: the first one in the run's execution order, because the
+    # builder works them in that order and nothing else is open.
+    #
+    # All three conjuncts are load-bearing, and each rules out a state that
+    # would otherwise be misread:
+    #   pushed      - an unpushed plan commit means the plan is still being
+    #                 applied, which is `applying plan` and outranks this;
+    #   sub_live    - a dirty tree on its own is any stray edit, or an
+    #                 untracked scratch directory nobody has cleaned up;
+    #   dirty       - a live sub-agent on its own may be a plan-only or
+    #                 read-only helper that will never touch the tree.
+    sub_live = (pending is not None and pending >= 1) or \
+               (sub_quiet_s is not None and sub_quiet_s < STALL_QUIET_S)
+    if pushed and head_past_base and sub_live and dirty:
+        nxt = first_todo(statuses, batches) or active[0]
+        return (V_UNDERWAY_INFLIGHT % nxt,
+                "the plan commit is pushed and a builder sub-agent is live (%s) "
+                "in a dirty tree; %s is the first todo batch in the run's order, "
+                "and nothing has been committed for it yet"
+                % ("pendingBackgroundAgentCount=%s" % pending
+                   if pending is not None and pending >= 1
+                   else "subagents/ touched %.0f min ago" % ((sub_quiet_s or 0) / 60.0),
+                   nxt))
+
+    # Nothing has moved on any batch and nothing is in flight.  `applying plan`
+    # is now only what its name says - the run's plan commit is absent or not
+    # pushed - and the transcript is what separates that from not started.
     if how == "derived" and live:
-        return V_APPLYING, "a builder for this run is live, no batch declared yet"
+        if not head_past_base:
+            return V_APPLYING, "a builder for this run is live and no plan commit exists yet"
+        if not pushed:
+            return V_APPLYING, "a builder for this run is live and the plan commit is not pushed yet"
+        return (V_UNCLEAR,
+                "the plan commit is pushed and a builder is live, but no batch is "
+                "declared, no row has moved and nothing is in flight")
     if how == "derived":
         return V_UNCLEAR, "a builder for this run exists but is quiet and has declared nothing"
     return V_NOT_STARTED, "no builder transcript for this run, and no batch declared"
