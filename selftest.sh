@@ -11,6 +11,13 @@ export SPANWEAVE_OPS_DIR="$OPS_DIR"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/spanweave-selftest.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# A floor, so the header's promise still holds.  `branch` is DERIVED from the
+# watched repo's checkout now, so any `config()` call that left
+# SPANWEAVE_BRANCH unset would shell out to the real ~/git/spanweave.  Every
+# section that cares overrides both; the branch-default cases below unset them
+# deliberately, against a fixture repo of their own.
+export SPANWEAVE_REPO="$TMP/no-such-repo" SPANWEAVE_BRANCH="selftest-floor"
+
 fail=0
 ok()   { printf '  PASS  %s\n' "$1"; }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=1; }
@@ -828,6 +835,178 @@ os.environ.pop("SPANWEAVE_BASE", None)
 sys.exit(bad)
 PYCFG
 [ $? -eq 0 ] || fail=1
+
+# ---------------------------------------------------------------------------
+echo
+echo "the branch is derived from the checkout, not assumed"
+# ---------------------------------------------------------------------------
+# `DEF_BRANCH` was the constant `audit-fixes`.  On 2026-09-30 a run-2 status
+# check ran against a repo that had moved to `live-graphs`: `git fetch origin
+# audit-fixes` failed with "couldn't find remote ref", `origin` read as the
+# stale sha of a branch nobody was on, and the report still printed a confident
+# `NOT pushed (origin b863767)`.  Every clause was produced by machinery
+# comparing against the wrong branch.
+R6D="$TMP/repo6"; mkdir -p "$R6D"
+git -C "$R6D" init -q -b live-graphs
+git -C "$R6D" config user.email t@example.invalid
+git -C "$R6D" config user.name Selftest
+cat > "$R6D/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L3 | thing | todo | 20 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$R6D" add -A && git -C "$R6D" commit -qm "base"
+BASE6="$(git -C "$R6D" rev-parse HEAD)"
+git init -q --bare "$TMP/remote6.git"
+git -C "$R6D" remote add origin "$TMP/remote6.git"
+git -C "$R6D" push -q origin live-graphs
+
+branchcfg() {  # branchcfg <repo> [SPANWEAVE_BRANCH] -> "<branch>|<src>"
+  env -u SPANWEAVE_BRANCH SPANWEAVE_REPO="$1" ${2:+SPANWEAVE_BRANCH="$2"} python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config
+cfg = config()
+print("%s|%s" % (cfg["branch"], cfg["branch_src"]))
+PY
+}
+
+check "with nothing given, the branch is the repo's own checkout" \
+      "$(branchcfg "$R6D")" "live-graphs|derived"
+check "an operator-given branch outranks the checkout" \
+      "$(branchcfg "$R6D" audit-fixes)" "audit-fixes|given"
+git -C "$R6D" checkout -q --detach HEAD
+check "a detached HEAD yields no branch, and says so rather than guessing" \
+      "$(branchcfg "$R6D")" "|undetermined"
+git -C "$R6D" checkout -q live-graphs
+
+TD6="$TMP/tdir6"; mkdir -p "$TD6"; ST6="$TMP/state6"; mkdir -p "$ST6"
+printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 2"}\n' > "$TD6/66666666.jsonl"
+
+run6() {  # run6 [branch] -> "<exit>|<event kinds>"; with no argument, no --branch
+  local out rc
+  out="$(env -u SPANWEAVE_BRANCH \
+         SPANWEAVE_STATE_DIR="$ST6" SPANWEAVE_REPO="$R6D" SPANWEAVE_TDIR="$TD6" \
+         SPANWEAVE_PINNED="" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+         SPANWEAVE_BASE="$BASE6" SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L3" \
+         SPANWEAVE_MEMO="" \
+         "$OPS_DIR/watch_run.sh" --once --run 2 ${1:+--branch "$1"} 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" > "$TMP/last_run6.txt"
+  printf '%s|%s' "$rc" \
+    "$(printf '%s\n' "$out" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)"
+}
+
+# End to end: no --branch, on a repo that is not on `audit-fixes`.  Under the
+# constant this poll fetched a ref that does not exist AND tripped the
+# wrong-branch condition on the repo's own checkout.
+check "no --branch on a non-audit-fixes repo polls clean" "$(run6)" "0|"
+grep -q "git fetch failed" "$TMP/last_run6.txt" \
+  && bad "the fetch still names a branch the remote does not have" \
+  || ok "the fetch names the branch the repo is actually on"
+grep -q "origin $(git -C "$R6D" rev-parse --short origin/live-graphs)" "$TMP/last_run6.txt" \
+  && ok "the banner compares against origin/live-graphs" \
+  || bad "the banner does not compare against origin/live-graphs"
+
+# The guard the derived default must not cost: an operator who names a branch
+# still gets told when the builder is somewhere else.  This is also why the
+# branch is resolved once at arming and not re-read per poll - re-derived, it
+# would follow the checkout and this could never fire.
+check "a given branch the repo is not on still trips the wire" \
+      "$(run6 audit-fixes)" "0|tripwire"
+grep -q "checked-out branch is 'live-graphs', not 'audit-fixes'" "$TMP/last_run6.txt" \
+  && ok "the block names both branches" || bad "the block does not name both branches"
+
+# ---------------------------------------------------------------------------
+echo
+echo "the arming PID set is derived, not assumed"
+# ---------------------------------------------------------------------------
+# `DEF_PIDS` was four PIDs from one session on 2026-09-10.  All four had exited
+# by 2026-09-30, so any watch that took the default was armed to fire `builder
+# gone` - a terminal trigger - on its first poll, on evidence about processes
+# that had been dead for weeks.
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import arming_pids, config
+
+# A synthetic `pgrep -af claude`, so the case is about the rule and not about
+# whatever happens to be running on this machine.
+PGREP = "\n".join([
+    "1351527 claude --dangerously-skip-permissions",
+    "1550331 claude",                      # not a builder: no --dangerously
+    "1558407 claude --dangerously-skip-permissions --resume abc",
+    "999 /usr/bin/claude-helper --dangerously-skip-permissions",   # wrong command
+    # The wrapper that runs the pgrep. Its command line QUOTES the pattern, so
+    # a substring match would enrol the watcher's own shell in the set it is
+    # about to watch for disappearance.
+    "424242 bash -c pgrep -af claude | grep 'claude --dangerous'",
+    "nonsense line with no pid",
+])
+cases = [
+    ("only --dangerously sessions are armed on",
+     arming_pids(PGREP), [1351527, 1558407]),
+    ("the pgrep wrapper never matches itself",
+     [p for p in arming_pids(PGREP) if p == 424242], []),
+    ("no claude process at all is an empty set, not a default",
+     arming_pids("nothing here"), []),
+]
+bad = 0
+for name, got, want in cases:
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+
+# Unset and empty are different: unset means arming has not run, empty means it
+# ran and found nothing.  Neither may fall back to a constant.
+for name, env, want in [
+    ("an unset PID set is empty and flagged unarmed", None, ("unarmed", [])),
+    ("an explicitly empty PID set stays empty",       "",   ("armed",   [])),
+    ("a given PID set is taken verbatim",         "7 9 8",  ("armed", [7, 8, 9])),
+]:
+    os.environ.pop("SPANWEAVE_PIDS", None)
+    if env is not None:
+        os.environ["SPANWEAVE_PIDS"] = env
+    cfg = config()
+    got = (cfg["pids_src"], sorted(cfg["pids"]))
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+os.environ.pop("SPANWEAVE_PIDS", None)
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# arming.sh resolves both once, and never overwrites what it was given.
+armed() {  # armed -> "<branch>|<pids>"
+  env -u SPANWEAVE_BRANCH -u SPANWEAVE_PIDS SPANWEAVE_REPO="$R6D" bash -c '
+    . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm
+    printf "%s|%s" "$SPANWEAVE_BRANCH" "${SPANWEAVE_PIDS+set}"'
+}
+check "arming derives the branch and marks the PID set resolved" \
+      "$(armed)" "live-graphs|set"
+check "arming leaves an operator's own values alone" \
+      "$(SPANWEAVE_REPO="$R6D" SPANWEAVE_BRANCH=given SPANWEAVE_PIDS="" bash -c '
+          . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm
+          printf "%s|%s" "$SPANWEAVE_BRANCH" "[$SPANWEAVE_PIDS]"')" \
+      "given|[]"
+
+# The consequence at the trigger: an empty set cannot shrink, so `builder gone`
+# has no signal - which the poll must say out loud rather than look quiet.
+check "an empty PID set does not fire builder gone" "$(run6)" "0|"
+grep -q "no PID set: 'builder gone' disarmed" "$TMP/last_run6.txt" \
+  && ok "the banner says the trigger is disarmed" \
+  || bad "the banner does not say the trigger is disarmed"
 
 # ---------------------------------------------------------------------------
 echo

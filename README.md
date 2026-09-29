@@ -1,7 +1,10 @@
 # spanweave-ops
 
-Read-only operator tooling for the **spanweave audit series** — the run-by-run
-execution of `WORKPLAN.md` on branch `audit-fixes` in `~/git/spanweave`.
+Read-only operator tooling for a **spanweave `WORKPLAN.md` series** — the
+run-by-run execution of a plan in `~/git/spanweave`. It was written for the
+audit-fixes series and is not tied to it: the branch it watches and the builder
+processes it watches for are **derived at arming time**, never named in a
+constant.
 
 Nothing here writes to that repo. Nothing here runs `make`, `uv`, or `pytest`.
 The only writes are under `state/`, which is gitignored. `WATCH.md` is the
@@ -15,16 +18,31 @@ behaviour contract; this file is how to run it.
 | `watch_monitor.sh` | Arming path under the **Monitor** tool. Re-invokes `watch_run.sh` forever; forwards only event blocks to stdout, banners to `state/poll.log`, plus an hourly `HEARTBEAT`. Stops on a terminal trigger. |
 | `watch_loop.sh` | Arming path in a **plain terminal**. Re-invokes `watch_run.sh` forever, everything to the terminal. Stops on a terminal trigger. |
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
+| `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 115 cases over throwaway fixtures. Proves both rules, the verdict vocabulary and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 133 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary and every dedup path. Touches neither the real repo nor the real transcript directory. |
+
+## What you have to pass, and what you do not
+
+Three things are **derived**, so the only flags a normal invocation needs are
+`--run`, `--batches` and `--base`:
+
+| | derived from | pass it only when |
+|---|---|---|
+| the branch | `git symbolic-ref --short HEAD` in `~/git/spanweave`, read **once at arming** | you want to watch a branch the repo is not on — which is also what arms the wrong-branch tripwire |
+| the builder PID set | the `claude --dangerous…` processes alive **at arming**, via `pgrep` | you know which processes are the builder's and the derived set is wrong |
+| the builder transcript | the derivation rule in `WATCH.md` — prompt, run number, not-an-aux-session | the derivation cannot see your session; then `SPANWEAVE_PINNED=<uuid>.jsonl` |
+
+None of the three is a constant any more, and that is the point: each one named
+a *session*, so each was stale by the run after the one it was written for. See
+the note at the end of this file.
 
 ## Invocations
 
 Status, right now:
 
 ```bash
-~/spanweave-ops/status_check.sh --run 3 --batches "R1 R2 R4 R6 R5 R3 R7" \
-  --memo "R3" --base fcc842d
+~/spanweave-ops/status_check.sh --run 2 --batches "L3 L4 L5 L6" --base 27ec3db
 ```
 
 Arm — **Monitor path** (the one in use; survives the host's low-memory guard
@@ -32,37 +50,40 @@ better than a tracked background task, because the Monitor holds it for the
 session):
 
 ```bash
-~/spanweave-ops/watch_monitor.sh --run 2 \
-  --batches "A5 A6 A7 A8 B3 A9 C3 D2 H2 G5 E2 E3 E4 F1 F2 G4" \
-  --base c79cbc5 --pids "820503 820602 820711 820816"
+~/spanweave-ops/watch_monitor.sh --run 2 --batches "L3 L4 L5 L6" --base 27ec3db
 ```
 
 Arm — **plain-loop path** (a terminal you will watch yourself):
 
 ```bash
-~/spanweave-ops/watch_loop.sh --run 2 \
-  --batches "A5 A6 A7 A8 B3 A9 C3 D2 H2 G5 E2 E3 E4 F1 F2 G4" \
-  --base c79cbc5 --pids "820503 820602 820711 820816"
+~/spanweave-ops/watch_loop.sh --run 2 --batches "L3 L4 L5 L6" --base 27ec3db
 ```
 
 Re-arm **after a usage-limit reset**. The builder is usually `/clear`ed and
-resumed, which forks a new transcript file, and its PIDs usually change. Take a
-fresh PID set and re-arm; leave `state/` alone so the tripwire does not
-re-report commits it already reported:
+resumed, which forks a new transcript file, and its PIDs change. Just re-arm —
+the new PID set is picked up by the arming itself. Leave `state/` alone so the
+tripwire does not re-report commits it already reported:
 
 ```bash
-pgrep -af claude                                   # note the new PID set
 ~/spanweave-ops/status_check.sh --run 2 --batches "…"   # confirm the derived transcript
-~/spanweave-ops/watch_monitor.sh --run 2 --batches "…" --base c79cbc5 \
-  --pids "<the new set>"
+~/spanweave-ops/watch_monitor.sh --run 2 --batches "…" --base <sha>
 ```
 
-The derivation follows the resumed session on its own as long as its prompt
-says `Resume WORKPLAN.md`, or mentions `WORKPLAN.md` and names the run — the
-run number need not be adjacent to the filename, so being pointed at a handover
-file (`Apply ~/Downloads/run3-2026-09-11.md … recreate WORKPLAN.md …`) is
-enough. If it does not, pass `SPANWEAVE_PINNED=<uuid>.jsonl`. To start the
+The transcript derivation follows the resumed session on its own as long as its
+prompt says `Resume WORKPLAN.md`, or mentions `WORKPLAN.md` and names the run —
+the run number need not be adjacent to the filename, so being pointed at a
+handover file (`Apply ~/Downloads/run3-2026-09-11.md … recreate WORKPLAN.md …`)
+is enough. If it does not, pass `SPANWEAVE_PINNED=<uuid>.jsonl`. To start the
 tripwire from scratch instead, `rm state/watch_state.json` first.
+
+**Why arming reads them once.** Both derived values are observations about the
+*start* of a watch, and re-reading either per poll would disarm a trigger
+rather than keep it fresh. `builder gone` fires when the PID set **shrinks**; a
+set re-derived each poll can never shrink. The branch tripwire fires when the
+checkout is not the branch being watched; a branch re-derived each poll would
+follow the builder onto any branch and call it normal. So `watch_monitor.sh`
+and `watch_loop.sh` — which re-invoke `watch_run.sh` every few minutes — arm
+once at their own start and export both down.
 
 Pass `--memo "R3"` to name the run's memo-only batches — the ones that must end
 `awaiting decision` and never touch `spanweave/`. It defaults to run 2's `F1`.
@@ -135,7 +156,7 @@ retries.
 |---|---|
 | `0` | invocation ran its budget out; non-terminal events may have been reported |
 | `10` | **finished** — origin moved past base, HEAD matches it, no batch still active |
-| `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete |
+| `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete. An **empty** arming set cannot shrink, so the trigger has no signal; every poll banner says `no PID set: 'builder gone' disarmed` rather than looking quiet |
 | `2` | watcher error (no builder transcript, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
 
 `status_check.sh` exits `0` when it printed a report, `2` on the same watcher
@@ -162,3 +183,27 @@ rather than re-reporting old commits.
 The Monitor path (`watch_monitor.sh` under the Monitor tool with
 `persistent: true`) is the arming path in use precisely because it is held for
 the session rather than as a tracked background bash task.
+
+## The stale-constant note
+
+**A constant that names a session is a lie in the next run.** Three defaults
+here were written down during the audit-fixes series and every one of them was
+wrong by 2026-09-30, when the repo had moved to `live-graphs`:
+
+- `DEF_BRANCH = "audit-fixes"` — `git fetch origin audit-fixes` failed with
+  *couldn't find remote ref*, so `origin` read as a stale sha belonging to a
+  branch nobody was on, and the report printed a confident
+  `NOT pushed (origin b863767)` derived from it. `finished` was structurally
+  unreachable for the whole watch.
+- `DEF_PIDS` — four PIDs from 2026-09-10, all long exited, so a watch taking
+  the default was armed to fire `builder gone` — a *terminal* trigger — on its
+  first poll, on evidence about processes dead for weeks.
+- `DEF_PINNED` — run 2's builder transcript, so every later run reported
+  `<-- FOLLOWED off the pin` while the derivation was in fact working. A drift
+  notice that fires when nothing has drifted trains the reader to ignore it.
+
+All three are derived now, and `selftest.sh` holds each one in place: the
+branch from the checkout and from a detached HEAD, the PID set from a synthetic
+`pgrep` (including that the `pgrep` wrapper never enrols itself in the set it
+is about to watch), and the fact that an empty set and an unset one are
+different answers.

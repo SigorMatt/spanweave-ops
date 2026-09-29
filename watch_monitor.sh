@@ -18,11 +18,21 @@
 #
 # usage: watch_monitor.sh [--run N] [--batches "A5 A6 ..."] [--base SHA]
 #                         [--branch NAME] [--pids "P P P"]
+#
+# --branch defaults to the repo's own checkout and --pids to the
+# `claude --dangerous...` processes alive now.  Both are resolved ONCE here,
+# before the loop, and exported to every `watch_run.sh` invocation: this script
+# re-invokes the watcher every few minutes, and re-deriving either per
+# invocation would quietly disarm the branch tripwire and `builder gone`.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SPANWEAVE_OPS_DIR="$HERE"
 STATE="${SPANWEAVE_STATE_DIR:-$HERE/state}"
 mkdir -p "$STATE"
+
+. "$HERE/arming.sh"
+spanweave_arm
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-6}"    # invocations (~9 min each) between heartbeats
 
 n=0

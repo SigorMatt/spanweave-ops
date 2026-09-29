@@ -8,6 +8,10 @@
 # usage: status_check.sh --run N --batches "A5 A6 ..." [--base SHA]
 #                        [--branch NAME] [--pids "P P P"] [--repo DIR]
 #
+# --branch defaults to the repo's own checkout (`git symbolic-ref --short
+# HEAD`) and --pids to the `claude --dangerous...` processes alive right now;
+# neither is a constant any more.  See arming.sh.
+#
 # Reads only.  Writes nothing anywhere - not to the repo, not to state/.
 # The one command that touches .git is `git fetch --quiet`, which updates the
 # remote-tracking ref only; `git status` runs with --no-optional-locks so it
@@ -30,20 +34,25 @@ while [ $# -gt 0 ]; do
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
     --repo)    export SPANWEAVE_REPO="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "usage: $(basename "$0") --run N --batches \"A5 A6 ...\" [--base SHA] [--branch NAME] [--pids \"P P P\"] [--repo DIR]" >&2; exit 2 ;;
   esac
 done
+
+# One-shot, so "armed once" and "armed now" are the same thing.
+. "$OPS_DIR/arming.sh"
+spanweave_arm
 
 python3 - <<'PY'
 import os, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (age, asks_question, claude_processes, config,
-                       declared_batches, derive_transcript, entry_line, git_in,
-                       is_stopped, limit_notice, live_pids, mtime, newest_under,
-                       pending_agents, resume_note_tail, stamp, subagents_dir,
-                       substantive, tail_entries, verdict, workplan_statuses)
+from watch_lib import (ARM_CMD_PREFIX, age, asks_question, claude_processes,
+                       config, declared_batches, derive_transcript, entry_line,
+                       git_in, is_stopped, limit_notice, live_pids, mtime,
+                       newest_under, pending_agents, resume_note_tail, stamp,
+                       subagents_dir, substantive, tail_entries, verdict,
+                       workplan_statuses)
 
 CFG     = config()
 REPO    = CFG["repo"]
@@ -51,6 +60,7 @@ TDIR    = CFG["tdir"]
 PINNED  = CFG["pinned"]
 BASE    = CFG["base"]
 BRANCH  = CFG["branch"]
+BRANCH_SRC = CFG["branch_src"]
 RUN     = CFG["run"]
 PIDSET  = CFG["pids"]
 BATCHES = CFG["batches"]
@@ -67,11 +77,16 @@ def head(title):
 
 # ------------------------------------------------------------------- repo ---
 head("repo")
-fetch_rc, _, fetch_err = git("fetch", "--quiet", "origin", BRANCH)
+# With no branch there is nothing to fetch and nothing to compare against;
+# fetching "origin ''" would only produce a confusing failure note.
+if BRANCH:
+    fetch_rc, _, fetch_err = git("fetch", "--quiet", "origin", BRANCH)
+else:
+    fetch_rc, fetch_err = 0, ""
 idx_m = mtime(os.path.join(REPO, ".git", "index"))
 _, headsha, _     = git("rev-parse", "HEAD")
 _, headshort, _   = git("rev-parse", "--short", "HEAD")
-_, origin, _      = git("rev-parse", "origin/%s" % BRANCH)
+_, origin, _      = git("rev-parse", "origin/%s" % BRANCH) if BRANCH else (1, "", "")
 _, basefull, _    = git("rev-parse", BASE)
 _, curbranch, _   = git("branch", "--show-current")
 _, statusshort, _ = git("--no-optional-locks", "status", "--short")
@@ -84,10 +99,15 @@ except Exception:                                   # noqa: BLE001
     last_commit_epoch = None
 
 print("path            : %s" % REPO)
-print("branch          : %s (expected %s)" % (curbranch, BRANCH))
+print("branch          : %s (watching %s, %s)"
+      % (curbranch or "(detached)", BRANCH or "(none)", BRANCH_SRC))
 print("HEAD            : %s (%s)" % (headsha, headshort))
-print("origin/%-8s: %s%s" % (BRANCH, origin,
-                             "" if origin != basefull else "  == base, not pushed"))
+if BRANCH:
+    print("origin/%-8s: %s%s" % (BRANCH, origin,
+                                 "" if origin != basefull else "  == base, not pushed"))
+else:
+    print("origin           : (no branch to compare against - the repo has a")
+    print("                   detached HEAD and none was given with --branch)")
 print("base            : %s (%s)" % (BASE, basefull))
 print("local main      : %s" % mainsha)
 print("last commit     : %s (%s ago)" % (stamp(last_commit_epoch),
@@ -147,9 +167,13 @@ head("builder processes")
 pgrep_out = claude_processes()
 running = live_pids(pgrep_out)
 missing_pids = [p for p in PIDSET if p not in running]
-print("PID set at arming: %s" % " ".join(str(p) for p in PIDSET))
+print("PID set at arming: %s" % (" ".join(str(p) for p in PIDSET) or "(empty)"))
 print("present now      : %s" % (" ".join(str(p) for p in PIDSET if p in running) or "(none)"))
 print("missing now      : %s" % (" ".join(str(p) for p in missing_pids) or "(none)"))
+if not PIDSET:
+    print("note             : no builder-shaped process (%r) is running, so this"
+          % ARM_CMD_PREFIX)
+    print("                   set is empty and `builder gone` has no signal.")
 print()
 print("pgrep -af claude (claude processes only):")
 shown = [l for l in pgrep_out.splitlines()
@@ -171,7 +195,12 @@ entries = tail_entries(tpath, 60)
 pending = pending_agents(entries)
 
 print("chosen     : %s  [%s]" % (tname, how))
-print("pin        : %s%s" % (PINNED, "" if tname == PINNED else "   <-- FOLLOWED off the pin"))
+# Only an operator-given pin is worth a line.  There is no default pin: a
+# constant naming one run's session made every later run report `<-- FOLLOWED
+# off the pin`, which reads as drift when it is the derivation working.
+if PINNED:
+    print("pin        : %s%s"
+          % (PINNED, "" if tname == PINNED else "   <-- FOLLOWED off the given pin"))
 print("lastPrompt : %s" % (tprompt or "")[:200])
 print("candidates : %d" % len(cands))
 for sm, om, name, lp in cands:
@@ -239,8 +268,14 @@ is_pushed = bool(origin) and origin == headsha
 v, why = verdict(statuses, plan_src, BATCHES, how, quiet_s, is_pushed,
                  asks, bool(limit_hit), declared_since_base)
 
-pushed_txt = ("pushed" if is_pushed
-              else "NOT pushed (origin %s)" % (origin[:7] if origin else "?"))
+if is_pushed:
+    pushed_txt = "pushed"
+elif origin:
+    pushed_txt = "NOT pushed (origin %s)" % origin[:7]
+else:
+    # No remote-tracking ref read at all - an unknown push state, which is not
+    # the same claim as "not pushed" and must not be printed as one.
+    pushed_txt = "push state unknown (no origin/%s)" % (BRANCH or "<branch>")
 print()
 print("VERDICT: %s" % v)
 print()

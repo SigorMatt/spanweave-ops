@@ -1,15 +1,17 @@
 # WATCH.md — read-only watch on a spanweave WORKPLAN.md builder run
 
 `watch_run.sh` observes the builder Claude Code session executing a run of
-`WORKPLAN.md` on branch `audit-fixes` in `~/git/spanweave`. It reports; it never
-intervenes. `status_check.sh` is the same knowledge as a one-shot report.
+`WORKPLAN.md` in `~/git/spanweave`. It reports; it never intervenes. The branch
+it watches is whichever one the repo is on when the watch is armed — not a
+name written down here. `status_check.sh` is the same knowledge as a one-shot report.
 `README.md` has the invocations; this file is the behaviour.
 
 ## What it is allowed to do
 
 Reads only:
 
-- `git fetch --quiet origin audit-fixes`, `git log`, `git rev-parse`,
+- `git symbolic-ref --short HEAD` (once, at arming, to learn the branch),
+  `git fetch --quiet origin <branch>`, `git log`, `git rev-parse`,
   `git --no-optional-locks status --short`, `git stash list`, `git show --stat`
 - file mtimes (`WORKPLAN.md`, `.git/index`, transcripts, sub-agent transcripts)
 - `pgrep -af claude`
@@ -41,10 +43,50 @@ Environment overrides (all optional, flags set the same variables):
 `SPANWEAVE_BASE`, `SPANWEAVE_BRANCH`, `SPANWEAVE_RUN`, `SPANWEAVE_BATCHES`,
 `SPANWEAVE_PIDS`, `SPANWEAVE_STATE_DIR`, `POLL_SECONDS`, `BUDGET_SECONDS`.
 
+`--branch` and `--pids` are optional and normally omitted; see **Arming**
+below. `SPANWEAVE_PINNED` is empty by default — there is no pinned transcript.
+
 Each poll prints a one-line banner naming the transcript it is watching, HEAD,
-`origin/audit-fixes`, the liveness timestamp and its age, the last observed
-`pendingBackgroundAgentCount`, the batches still active, and any currently
-suppressed trigger. Banners are appended to `state/poll.log`.
+`origin/<branch>`, the liveness timestamp and its age, the last observed
+`pendingBackgroundAgentCount`, the batches still active, any currently
+suppressed trigger, and — if the arming PID set is empty — that `builder gone`
+is disarmed. Banners are appended to `state/poll.log`.
+
+## Arming
+
+Two facts are resolved **once**, when a watch is armed, by `arming.sh`, and
+then held fixed for the life of that watch. Both used to be constants in
+`watch_lib.py`, and both were stale by the next run.
+
+| | default | resolved by |
+|---|---|---|
+| branch | `git symbolic-ref --short HEAD` in the watched repo | `arming.sh` at start, exported |
+| PID set | the `claude --dangerous…` processes alive now | `arming.sh` at start, exported |
+
+`watch_monitor.sh` and `watch_loop.sh` re-invoke `watch_run.sh` every few
+minutes, so **they** arm, at their own start, and export both down; a
+`watch_run.sh` started directly arms for itself. Whoever arms first owns both
+values for the whole watch.
+
+**Why once and not per poll.** Re-reading either would disarm a trigger rather
+than keep it fresh:
+
+- `builder gone` fires when the PID set **shrinks**. A set re-derived each poll
+  can never shrink.
+- the branch tripwire fires when the checkout is not the branch being watched.
+  A branch re-derived each poll would follow the builder onto any branch it
+  checked out and report nothing.
+
+**Empty is not a constant.** An empty PID set (no `claude --dangerous…` process
+is running, or `--pids ""` was passed) leaves `builder gone` with no signal;
+every banner says so. A repo with a **detached HEAD** yields no branch: there
+is no `origin/…` to compare against, `finished` becomes unreachable, and the
+poll prints a note saying exactly that. Neither degrades into a guess.
+
+The `pgrep` match is anchored to the start of the *command* (`claude
+--dangerous`), not searched anywhere in the line, so the wrapper process that
+runs the `pgrep` — whose own command line quotes the pattern — can never enrol
+itself in the set it is about to watch for disappearance.
 
 ## Per-trigger policy
 
@@ -164,6 +206,14 @@ the transcript's own mtime, then the name. (That is the *derivation* tiebreak;
 is used — an operator override, so it is not re-tested against the run number.
 With no candidate and no pin the script exits `2`.
 
+**There is no default pin.** `SPANWEAVE_PINNED` is empty unless an operator
+sets it. It used to name run 2's builder transcript, which meant every run
+after run 2 reported `<-- FOLLOWED off the pin` while the derivation was in
+fact working — a drift notice that fires when nothing has drifted, which
+trains the reader to ignore it. The pin is now only what you pass when the
+derivation cannot see your session, and the `FOLLOWED` line appears only
+against a pin you gave.
+
 So a builder that is `/clear`ed and resumed after a usage-limit reset — which
 forks a brand-new transcript file — is followed instead of the old one being
 declared dead. When the chosen file differs from the pin, the banner says
@@ -232,7 +282,8 @@ longer needs the state file deleted. With no `--base`, the range is
 - touches `tests/serialized_shape.json` and the body does not mention
   `serialized_shape`
 - the commit **declares** a batch outside the run list
-- the checked-out branch is not `audit-fixes`, or local `main` moved
+- the checked-out branch is not the branch this watch was armed on, or local
+  `main` moved
 - `git stash list` grew
 
 Evidence: `git show --stat` plus subject and body for each newly reported
@@ -273,7 +324,7 @@ write a bare `done` — it writes ``done (`0e4262e`)`` — so once run 3's rows
 became visible at all, every completed batch still read as active. All four are
 prefix-matched now.
 
-**finished** *(terminal)* — `origin/audit-fixes` moved past the base, **and**
+**finished** *(terminal)* — `origin/<branch>` moved past the base, **and**
 local HEAD equals it, **and** no listed batch is `todo` or `in progress`.
 `done`, `dropped`, `awaiting …`, `blocked …` all count as stopped. Evidence:
 `git log --oneline <base>..HEAD`, the status line for each listed batch, the
@@ -297,12 +348,13 @@ finding the last substantive entry. Evidence: the reason, the liveness block, th
 last 20 entries with type/role and 200-character previews, batch statuses.
 
 **builder gone** *(terminal)* — any PID from the set observed at arming time is
-no longer present while the run is incomplete. Which of the four `claude`
-processes is the builder is not knowable from outside, so the set shrinking is
-the signal. Evidence: `pgrep -af claude`, the missing PIDs, the still-active
-batches, the last 10 transcript entries, the liveness block.
+no longer present while the run is incomplete. Which of the `claude
+--dangerous…` processes is the builder is not knowable from outside, so the set
+shrinking is the signal. Evidence: `pgrep -af claude`, the missing PIDs, the
+still-active batches, the last 10 transcript entries, the liveness block.
 *Note:* if the human restarts sessions for an unrelated reason this fires on a
-stale PID set — re-arm with `--pids "…"`.
+stale PID set — just re-arm, and arming takes a fresh set. An empty set
+disarms the trigger; the banner says so every poll.
 
 **stall** — no new local commit, no `.git/index` mtime change, and no
 liveness movement for 40 minutes while a batch is in progress ("in progress" =
@@ -328,7 +380,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 115 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 133 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -340,8 +392,20 @@ declaration and not on a citation; all six verdict values, including that
 `waiting on user` outranks an in-progress row but not a finished, pushed run;
 and every dedup path — tripwire once-per-sha, waiting
 once-then-`RESUMED`-then-again, stall once-then-40-min-then-again, and both
-terminal exits; and the series-close cases, where `WORKPLAN.md` is deleted
-staged, then committed, then reached `finished` with the plan closed.
+terminal exits; the series-close cases, where `WORKPLAN.md` is deleted staged,
+then committed, then reached `finished` with the plan closed; and the two
+derived defaults — the branch from the checkout, from an operator flag and from
+a detached HEAD, a poll with no `--branch` against a repo that is *not* on
+`audit-fixes` running clean while a given-but-wrong branch still trips the
+wire, the PID set from a synthetic `pgrep` including that the wrapper never
+matches itself, unset-versus-empty, and an empty set leaving `builder gone`
+disarmed and saying so.
+
+Because the branch is derived, an unset `SPANWEAVE_BRANCH` would make
+`config()` shell out to the *real* repo. `selftest.sh` exports a fixture floor
+for `SPANWEAVE_REPO` and `SPANWEAVE_BRANCH` at the top so the promise in its
+header still holds; the branch cases unset them deliberately, against a fixture
+repo of their own.
 
 The dedup fixtures pin their timestamps once rather than recomputing
 `touch -d '-20 min'` per call. Recomputing made the fixture lift its own
@@ -379,3 +443,13 @@ and each trigger's evidence block rendering correctly.
 - 2026-09-10 04:25: the watch died `exit 2` when G4 staged the deletion of
   `WORKPLAN.md`. Fixed above — the plan now has three sources and an absent
   plan is a closed series, not an error.
+- 2026-09-30: the three session-shaped constants were retired. A run-2 status
+  check against the `live-graphs` series compared everything against
+  `origin/audit-fixes`: `git fetch` failed with *couldn't find remote ref*,
+  `origin` read as a stale sha from a branch nobody was on, and the report
+  still printed `NOT pushed (origin b863767)` — machinery comparing against the
+  wrong branch, stated as fact. The same check reported all four arming PIDs
+  missing (they had exited weeks earlier, so a watch would have fired the
+  terminal `builder gone` on its first poll) and `<-- FOLLOWED off the pin`
+  while the derivation had in fact found the right transcript. Branch and PID
+  set are now derived at arming (see **Arming**); the pin defaults to empty.

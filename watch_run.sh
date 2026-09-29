@@ -19,6 +19,11 @@
 # usage: watch_run.sh [--once] [--run N] [--batches "A5 A6 ..."] [--memo "F1"]
 #                     [--base SHA] [--branch NAME] [--pids "P P P"]
 #
+# --branch defaults to the repo's own checkout (`git symbolic-ref --short
+# HEAD`) and --pids to the `claude --dangerous...` processes alive now.  Both
+# are resolved ONCE, here, and held for every poll of this invocation - see
+# arming.sh for why a per-poll reading would disarm two triggers.
+#
 # Exit codes: 0 nothing terminal (non-terminal events may have been printed)
 #             10 finished | 13 builder gone | 2 watcher error
 # 11 waiting on user, 12 stall and 14 tripwire are printed events, not exits.
@@ -43,10 +48,15 @@ while [ $# -gt 0 ]; do
     --base)    export SPANWEAVE_BASE="$2"; shift 2 ;;
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--memo \"F1\"] [--base SHA] [--branch NAME] [--pids \"P P P\"]" >&2; exit 2 ;;
   esac
 done
+
+# Before the poll loop, and a no-op when watch_monitor.sh or watch_loop.sh
+# already armed and exported: whoever armed first owns both values.
+. "$OPS_DIR/arming.sh"
+spanweave_arm
 
 start=$(date +%s)
 
@@ -145,7 +155,10 @@ def main():
     live  = max([x for x in (t_m, s_m) if x is not None], default=None)
     entries = tail_entries(tpath, 60)
     pending = pending_agents(entries)
-    followed = (tname != PINNED)
+    # Only meaningful against an operator-given pin.  There is no default pin
+    # any more, and reporting "FOLLOWED" against an empty one would put a drift
+    # notice on every poll of every run.
+    followed = bool(PINNED) and tname != PINNED
 
     # -- repo ----------------------------------------------------------------
     # Stat the index BEFORE running any git command: a plain `git status` can
@@ -153,10 +166,16 @@ def main():
     # watcher's own read look like builder activity.  (`--no-optional-locks`
     # below is the second half of that guard.)
     idx_m = mtime(os.path.join(REPO, ".git", "index"))
-    fetch_rc, _, fetch_err = git("fetch", "--quiet", "origin", BRANCH)
+    # With no branch there is no ref to fetch and none to compare against, so
+    # `origin` stays empty and `finished` stays unreachable - reported at the
+    # end of the poll rather than silently.
+    if BRANCH:
+        fetch_rc, _, fetch_err = git("fetch", "--quiet", "origin", BRANCH)
+    else:
+        fetch_rc, fetch_err = 0, ""
     _, head, _        = git("rev-parse", "HEAD")
     _, headshort, _   = git("rev-parse", "--short", "HEAD")
-    _, origin, _      = git("rev-parse", "origin/%s" % BRANCH)
+    _, origin, _      = git("rev-parse", "origin/%s" % BRANCH) if BRANCH else (1, "", "")
     _, basefull, _    = git("rev-parse", BASE)
     _, curbranch, _   = git("branch", "--show-current")
     _, statusshort, _ = git("--no-optional-locks", "status", "--short")
@@ -196,8 +215,11 @@ def main():
                  "  <-- FOLLOWED (pin was %s)" % PINNED if followed else "",
                  headshort, origin[:7] if origin else "?", stamp(live), age(live, now),
                  pending, ",".join(active) if active else "(none)",
-                 ("%s%s" % (" | plan from %s" % plan_src if plan_src != "worktree" else "",
-                            " | suppressed: %s" % ",".join(suppressed) if suppressed else ""))))
+                 ("%s%s%s" % (" | plan from %s" % plan_src if plan_src != "worktree" else "",
+                              " | suppressed: %s" % ",".join(suppressed) if suppressed else "",
+                              # A lost terminal trigger is worth a per-poll
+                              # reminder: an empty set can never shrink.
+                              "" if PIDSET else " | no PID set: 'builder gone' disarmed"))))
     print(banner, flush=True)
     try:
         with open(LOG, "a") as fh:
@@ -311,7 +333,10 @@ def main():
             hits.append((sha, "declares batch(es) outside the run-%d list: %s"
                               % (RUN, ", ".join(outside))))
 
-    if curbranch and curbranch != BRANCH:
+    # BRANCH is the branch the repo was on when this watch was armed, so this
+    # still means what it always meant: the builder has checked out something
+    # else since. With no branch at arming there is nothing to have left.
+    if BRANCH and curbranch and curbranch != BRANCH:
         ckey = "branch:%s" % curbranch
         if ckey not in conditions:
             hits.append(("-", "checked-out branch is %r, not %r" % (curbranch, BRANCH)))
@@ -469,7 +494,11 @@ def main():
             st["stall"] = dict(obs, fired_at=now)
 
     # -------------------------------------------------------------- no trigger --
-    if fetch_rc != 0:
+    if not BRANCH:
+        print("  note: the repo has a detached HEAD and no --branch was given, so"
+              " there is no origin/... to compare - 'finished' cannot fire",
+              flush=True)
+    elif fetch_rc != 0:
         print("  note: git fetch failed (%s) - 'finished' cannot fire this poll"
               % (fetch_err or fetch_rc), flush=True)
     return code, events, st

@@ -19,7 +19,13 @@ import time
 
 DEF_REPO   = os.path.expanduser("~/git/spanweave")
 DEF_TDIR   = os.path.expanduser("~/.claude/projects/-home-msi-git-spanweave")
-DEF_PINNED = "28018437-a07a-443c-b854-7c4589983fc7.jsonl"
+# No pin.  `DEF_PINNED` used to name run 2's builder transcript, and a constant
+# that names one session is a lie in every run after it: on 2026-09-30 a run-2
+# check reported `<-- FOLLOWED off the pin` while the derivation had already
+# found the right file on its own, which reads as drift rather than as the rule
+# working.  The derivation (rule (b)) is the rule; a pin is now only what an
+# operator passes when the derivation cannot see their session.
+DEF_PINNED = ""
 # Watcher/aux sessions that ran this tooling from inside the same project
 # directory in the *past*.  A watcher must never derive onto itself, and a
 # static list cannot know about the session it is running in, so this list is
@@ -27,9 +33,15 @@ DEF_PINNED = "28018437-a07a-443c-b854-7c4589983fc7.jsonl"
 DEF_SELF   = ("c2a395dd-9fdb-4c60-8878-b3c4e7a5a48d.jsonl "
               "05be40ff-b82d-4a92-bc3c-df42832b095c.jsonl")
 DEF_BASE   = "c79cbc5"
-DEF_BRANCH = "audit-fixes"
+# Branch and PID set are DERIVED, never assumed - see `default_branch` and
+# `arming_pids`.  Both were constants until 2026-09-30 and both were stale by
+# then: `audit-fixes` for a repo that had moved to `live-graphs`, so every
+# `origin/...` comparison and the `git fetch` named a ref that no longer
+# existed, and four PIDs whose processes had all exited, so `builder gone` was
+# armed to fire on the first poll of any watch that used the default.
+DEF_BRANCH = ""
 DEF_RUN    = "2"
-DEF_PIDS   = "820503 820602 820711 820816"
+DEF_PIDS   = ""
 DEF_BATCHES = "A5 A6 A7 A8 B3 A9 C3 D2 H2 G5 E2 E3 E4 F1 F2 G4"
 # Memo-only batches: they end `awaiting decision` and must never touch
 # spanweave/.  Per-run, so it is configurable (run 2: F1; run 3: R3).
@@ -41,11 +53,73 @@ DEF_MEMO   = "F1"
 WAIT_QUIET_S = 10 * 60
 
 
+def repo_dir():
+    """The watched repo, resolved without the rest of the configuration.
+
+    Separate from `config()` because the two derived defaults below need the
+    repo path *before* a configuration exists - and `config()` derives the
+    branch, so asking it for the repo in order to derive the branch would be
+    circular."""
+    return os.environ.get("SPANWEAVE_REPO", DEF_REPO)
+
+
+def default_branch(repo):
+    """The branch `repo` has checked out right now, or "" if it has none.
+
+    This is a default, resolved at *arming* time by `arming.sh` and then held
+    fixed for the life of the watch - not a per-poll reading.  The distinction
+    is the whole point: the tripwire's "checked-out branch is not the one we
+    are watching" condition is only a guard if the expected branch is a fact
+    from arming time.  A branch re-read every poll would follow the builder
+    onto any branch it checked out and report nothing.
+
+    "" is returned for a detached HEAD or a path that is not a repo.  There is
+    no honest fallback name - falling back to a constant is exactly the bug
+    this replaces - so callers report the gap instead of papering over it."""
+    rc, out, _ = git_in(repo)("symbolic-ref", "--short", "HEAD")
+    return out.strip() if rc == 0 else ""
+
+
+# A builder session is started with `--dangerously-skip-permissions`; the
+# watcher and other aux sessions are not.  Matched as a prefix of the *command*
+# rather than anywhere in the line, so the `pgrep` wrapper - a bash or python3
+# process whose own command line quotes this pattern - can never match itself.
+ARM_CMD_PREFIX = "claude --dangerous"
+
+
+def arming_pids(pgrep_out=None):
+    """The builder-shaped `claude` PIDs alive now, sorted.
+
+    Resolved once when a watch is armed, never per poll: `builder gone` fires
+    when this set *shrinks*, and a set re-derived each poll can never shrink.
+    See `arming.sh`, which is the only thing that should call this."""
+    out = claude_processes() if pgrep_out is None else pgrep_out
+    pids = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() \
+                and parts[1].startswith(ARM_CMD_PREFIX):
+            pids.append(int(parts[0]))
+    return sorted(pids)
+
+
 def config():
     """Resolve configuration from the environment.  Callers set these; the
     shell front ends turn their flags into these variables."""
+    repo = repo_dir()
+    # An operator-given branch outranks the checkout, and an empty value is
+    # not a branch name, so it counts as "not given".  With nothing given the
+    # branch is derived here too - so a direct `watch_lib` caller is not left
+    # with a wrong constant - but the front ends resolve it once at arming and
+    # export it, which is what keeps it fixed across polls.
+    branch_env = (os.environ.get("SPANWEAVE_BRANCH") or "").strip()
+    branch = branch_env or default_branch(repo)
+    # Unset and empty differ for the PID set: unset means `arming.sh` has not
+    # run yet, empty means it ran and there was nothing to arm on (or a caller
+    # deliberately disarmed the trigger).  Only the front ends derive.
+    pids_env = os.environ.get("SPANWEAVE_PIDS")
     return {
-        "repo":    os.environ.get("SPANWEAVE_REPO", DEF_REPO),
+        "repo":    repo,
         "tdir":    os.environ.get("SPANWEAVE_TDIR", DEF_TDIR),
         "pinned":  os.environ.get("SPANWEAVE_PINNED", DEF_PINNED),
         "self":    [n for n in os.environ.get("SPANWEAVE_SELF", DEF_SELF)
@@ -57,10 +131,16 @@ def config():
         # base outranks the baseline a previous run persisted, a defaulted one
         # must not (see `watch_run.sh`, TRIPWIRE).
         "base_explicit": bool((os.environ.get("SPANWEAVE_BASE") or "").strip()),
-        "branch":  os.environ.get("SPANWEAVE_BRANCH", DEF_BRANCH),
+        "branch":  branch,
+        # "given" | "derived" | "undetermined" - so a report can say where the
+        # branch it compares against came from, and say so loudly when the
+        # checkout has no branch at all and every `origin/...` answer is empty.
+        "branch_src": ("given" if branch_env
+                       else "derived" if branch else "undetermined"),
         "run":     int(os.environ.get("SPANWEAVE_RUN", DEF_RUN)),
-        "pids":    [int(x) for x in os.environ.get("SPANWEAVE_PIDS", DEF_PIDS)
+        "pids":    [int(x) for x in (pids_env if pids_env is not None else DEF_PIDS)
                     .replace(",", " ").split()],
+        "pids_src": "unarmed" if pids_env is None else "armed",
         "batches": os.environ.get("SPANWEAVE_BATCHES", DEF_BATCHES)
                    .replace(",", " ").split(),
         "memo":    os.environ.get("SPANWEAVE_MEMO", DEF_MEMO)
@@ -324,9 +404,14 @@ def derive_transcript(cfg):
     cands.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
     if cands:
         return cands[0][2], cands[0][3], cands, "derived", rejected
-    pin = os.path.join(cfg["tdir"], cfg["pinned"])
-    if os.path.exists(pin):
-        return cfg["pinned"], last_prompt(pin), cands, "pin (no candidate)", rejected
+    # There is no default pin any more, so this branch is reached only when an
+    # operator passed one.  With neither a candidate nor a pin the answer is
+    # "no builder transcript for this run", which the callers report as a
+    # watcher error rather than guessing at a file.
+    if cfg["pinned"]:
+        pin = os.path.join(cfg["tdir"], cfg["pinned"])
+        if os.path.exists(pin):
+            return cfg["pinned"], last_prompt(pin), cands, "pin (no candidate)", rejected
     return None, None, cands, "none", rejected
 
 
