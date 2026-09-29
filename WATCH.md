@@ -42,6 +42,9 @@ Environment overrides (all optional, flags set the same variables):
 `SPANWEAVE_REPO`, `SPANWEAVE_TDIR`, `SPANWEAVE_PINNED`, `SPANWEAVE_SELF`,
 `SPANWEAVE_BASE`, `SPANWEAVE_BRANCH`, `SPANWEAVE_RUN`, `SPANWEAVE_BATCHES`,
 `SPANWEAVE_PIDS`, `SPANWEAVE_STATE_DIR`, `POLL_SECONDS`, `BUDGET_SECONDS`.
+`SPANWEAVE_BRANCH_SRC` is set by `arming.sh`, not by hand: arming *exports*
+the branch it derived, so without a marker every downstream `config()` would
+see a branch in the environment and report it as `given`.
 
 `--branch` and `--pids` are optional and normally omitted; see **Arming**
 below. `SPANWEAVE_PINNED` is empty by default — there is no pinned transcript.

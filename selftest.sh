@@ -988,13 +988,20 @@ PY
 [ $? -eq 0 ] || fail=1
 
 # arming.sh resolves both once, and never overwrites what it was given.
-armed() {  # armed -> "<branch>|<pids>"
-  env -u SPANWEAVE_BRANCH -u SPANWEAVE_PIDS SPANWEAVE_REPO="$R6D" bash -c '
+armed() {  # armed -> "<branch>|<src>|<pids resolved?>"
+  env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+      SPANWEAVE_REPO="$R6D" bash -c '
     . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm
-    printf "%s|%s" "$SPANWEAVE_BRANCH" "${SPANWEAVE_PIDS+set}"'
+    printf "%s|%s|%s" "$SPANWEAVE_BRANCH" \
+           "$(python3 -c "import os,sys;sys.path.insert(0,os.environ[\"SPANWEAVE_OPS_DIR\"]);
+from watch_lib import config;print(config()[\"branch_src\"])")" \
+           "${SPANWEAVE_PIDS+set}"'
 }
-check "arming derives the branch and marks the PID set resolved" \
-      "$(armed)" "live-graphs|set"
+# Arming EXPORTS the branch it derived, so without a marker every downstream
+# config() would see a branch in the environment and call it `given` - the one
+# thing a report about a derived default must not get wrong.
+check "arming derives the branch and says it derived it" \
+      "$(armed)" "live-graphs|derived|set"
 check "arming leaves an operator's own values alone" \
       "$(SPANWEAVE_REPO="$R6D" SPANWEAVE_BRANCH=given SPANWEAVE_PIDS="" bash -c '
           . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm

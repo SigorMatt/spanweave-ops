@@ -51,6 +51,15 @@ PY
   if [ "$need_branch" -eq 1 ]; then
     SPANWEAVE_BRANCH="$(printf '%s\n' "$out" | sed -n 1p)"
     export SPANWEAVE_BRANCH
+    # Say who resolved it.  Arming exports the branch, so without this marker
+    # every downstream `config()` sees a branch in the environment and reports
+    # it as `given` - i.e. as though the operator had named it - which is the
+    # one thing a report about a derived default must not get wrong.
+    if [ -n "$SPANWEAVE_BRANCH" ]; then
+      export SPANWEAVE_BRANCH_SRC=derived
+    else
+      export SPANWEAVE_BRANCH_SRC=undetermined
+    fi
   fi
   if [ "$need_pids" -eq 1 ]; then
     SPANWEAVE_PIDS="$(printf '%s\n' "$out" | sed -n 2p)"

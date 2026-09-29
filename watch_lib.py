@@ -114,6 +114,10 @@ def config():
     # export it, which is what keeps it fixed across polls.
     branch_env = (os.environ.get("SPANWEAVE_BRANCH") or "").strip()
     branch = branch_env or default_branch(repo)
+    branch_src = (os.environ.get("SPANWEAVE_BRANCH_SRC") or "").strip()
+    if branch_src not in ("given", "derived", "undetermined"):
+        branch_src = ("given" if branch_env
+                      else "derived" if branch else "undetermined")
     # Unset and empty differ for the PID set: unset means `arming.sh` has not
     # run yet, empty means it ran and there was nothing to arm on (or a caller
     # deliberately disarmed the trigger).  Only the front ends derive.
@@ -135,8 +139,9 @@ def config():
         # "given" | "derived" | "undetermined" - so a report can say where the
         # branch it compares against came from, and say so loudly when the
         # checkout has no branch at all and every `origin/...` answer is empty.
-        "branch_src": ("given" if branch_env
-                       else "derived" if branch else "undetermined"),
+        # `arming.sh` states it, because it exports the branch it derived and
+        # the environment alone cannot then tell the two apart.
+        "branch_src": branch_src,
         "run":     int(os.environ.get("SPANWEAVE_RUN", DEF_RUN)),
         "pids":    [int(x) for x in (pids_env if pids_env is not None else DEF_PIDS)
                     .replace(",", " ").split()],
