@@ -835,3 +835,75 @@ def live_pids(pgrep_out):
         if tok.isdigit():
             out.add(int(tok))
     return out
+
+
+# -------------------------------------------------------------- CI on the tip
+#
+# WORKPLAN.md section 0.1 step 8 ends a run at "pushed AND CI green on the
+# pushed tip", and says in as many words that a local `make check` is not a
+# substitute.  `finished` used to fire on "origin moved, HEAD matches it, no
+# batch open", which is the *push* half of that sentence only - so a run whose
+# CI went red on the tip it had just pushed was reported as finished.
+#
+# Four answers, not two.  "gh could not tell us anything" must never be read as
+# "CI is red", and it must never be read as "CI is green" either: both of those
+# are claims about the build, and the only honest thing to say is that the
+# claim is unverified.  And "gh answered, and has no run for this sha yet" is
+# NOT that case - a workflow that has not been queued yet is pending, which is
+# a fact about CI, so it is reported as pending and the watch keeps polling.
+CI_TIMEOUT_S = 25
+# Statuses that mean the run exists but has not concluded.  `gh` reports
+# `queued`, `in_progress`, `waiting`, `requested` and `pending` here.
+CI_OPEN_STATUS = {"queued", "in_progress", "waiting", "requested", "pending"}
+
+
+def ci_conclusion(repo, branch, sha, timeout=CI_TIMEOUT_S):
+    """What CI says about `sha`, as ("success"|"pending"|"failure"|"unavailable",
+    why).  Read-only: one bounded `gh run list`, with a timeout, so a hanging
+    or unauthenticated `gh` costs one poll rather than wedging the watch.  Any
+    failure to *read* an answer is "unavailable", never "failure"."""
+    if not sha:
+        return "unavailable", "no tip sha to ask about"
+    if not branch:
+        return "unavailable", "no branch to ask about"
+    cmd = ["gh", "run", "list", "--branch", branch, "--limit", "40",
+           "--json", "headSha,status,conclusion"]
+    try:
+        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
+                           timeout=timeout)
+    except FileNotFoundError:
+        return "unavailable", "gh is not on PATH"
+    except subprocess.TimeoutExpired:
+        return "unavailable", "gh did not answer within %ds" % timeout
+    except Exception as exc:                   # noqa: BLE001 - never die here
+        return "unavailable", "gh could not be run: %s: %s" % (type(exc).__name__, exc)
+    if p.returncode != 0:
+        first = (p.stderr or "").strip().splitlines()
+        return "unavailable", ("gh exited %d: %s"
+                               % (p.returncode, first[0][:160] if first else "(no stderr)"))
+    raw = (p.stdout or "").strip()
+    if not raw:
+        return "unavailable", "gh exited 0 but printed nothing"
+    try:
+        runs = json.loads(raw)
+    except Exception:                          # noqa: BLE001
+        return "unavailable", "gh printed something that is not JSON"
+    if not isinstance(runs, list):
+        return "unavailable", "gh printed JSON that is not a list of runs"
+    mine = [r for r in runs if isinstance(r, dict) and r.get("headSha") == sha]
+    if not mine:
+        return "pending", ("gh lists no workflow run for %s yet (%d run(s) on %s)"
+                           % (sha[:7], len(runs), branch))
+    unfinished = [r for r in mine
+                  if not (r.get("conclusion") or "").strip()
+                  or (r.get("status") or "").strip().lower() in CI_OPEN_STATUS]
+    if unfinished:
+        return "pending", ("%d of %d run(s) on %s have not concluded"
+                           % (len(unfinished), len(mine), sha[:7]))
+    concs = [(r.get("conclusion") or "").strip().lower() for r in mine]
+    notgreen = sorted({c for c in concs if c != "success"})
+    if notgreen:
+        return "failure", ("%d run(s) on %s concluded %s"
+                           % (len([c for c in concs if c != "success"]),
+                              sha[:7], ", ".join(notgreen)))
+    return "success", "%d run(s) on %s concluded success" % (len(concs), sha[:7])

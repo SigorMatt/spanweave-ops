@@ -16,6 +16,9 @@ Reads only:
 - file mtimes (`WORKPLAN.md`, `.git/index`, transcripts, sub-agent transcripts)
 - `pgrep -af claude`
 - tails of the builder's transcript JSONL
+- one bounded, read-only `gh run list --branch <branch> --json
+  headSha,status,conclusion` in the watched repo, asked only when everything
+  else `finished` needs is already true
 
 It **never** writes to the repo, never commits, never checks out, never runs
 `make`, `uv`, or `pytest`. Its only writes are under `state/`;
@@ -94,14 +97,17 @@ itself in the set it is about to watch for disappearance.
 
 ## Per-trigger policy
 
-Two triggers are **terminal** — they stop the watch and set the exit code.
-The other three are **report-and-continue**: they print their evidence block
+The finished trigger — in all three of its forms — and `builder gone` are
+**terminal**: they stop the watch and set the exit code. The other three are
+**report-and-continue**: they print their evidence block
 and the loop goes on polling, so a single tripwire hit or a pause for a
 question no longer costs the watch.
 
 | trigger | terminal? | repeat policy |
 |---|---|---|
 | **finished** | yes, exit `10` | — |
+| **finished (CI unverified)** | yes, exit `10` | — |
+| **finished: CI red on `<sha>`** | yes, exit `15` | — |
 | **builder gone** | yes, exit `13` | — |
 | **tripwire** | no | per commit sha, once ever; `state/watch_state.json` keeps `reported_commits` |
 | **waiting on user** | no | once, then suppressed until liveness moves |
@@ -142,7 +148,8 @@ brackets every event:
 | code | meaning |
 |---|---|
 | `0` | the invocation ran out its budget; non-terminal events may have been printed |
-| `10` | **finished** (terminal) |
+| `10` | **finished** (terminal), and also **finished (CI unverified)** — same end state, an unread CI |
+| `15` | **finished: CI red on `<sha>`** (terminal) |
 | `13` | **builder gone** (terminal) |
 | `2` | watcher error (no builder transcript found, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
 
@@ -329,10 +336,48 @@ became visible at all, every completed batch still read as active. All four are
 prefix-matched now.
 
 **finished** *(terminal)* — `origin/<branch>` moved past the base, **and**
-local HEAD equals it, **and** no listed batch is `todo` or `in progress`.
-`done`, `dropped`, `awaiting …`, `blocked …` all count as stopped. Evidence:
-`git log --oneline <base>..HEAD`, the status line for each listed batch, the
-resume-note tail, `git status --short`.
+local HEAD equals it, **and** no listed batch is `todo` or `in progress`,
+**and** CI concluded `success` on the pushed tip. `done`, `dropped`,
+`awaiting …`, `blocked …` all count as stopped. Evidence: the CI answer and
+where it came from, `git log --oneline <base>..HEAD`, the status line for each
+listed batch, the resume-note tail, `git status --short`.
+
+*Why CI is a conjunct.* `WORKPLAN.md` §0.1 step 8 ends a run at **pushed and
+green**, and says in as many words that a local `make check` is not a
+substitute for the checks that run on the pushed sha. The first three
+conjuncts are the push half only, so a run whose CI went red on the tip it had
+just pushed used to be reported, terminally, as finished.
+
+The three git conditions decide **whether to ask**; CI decides **what the
+answer is**, in four shapes:
+
+| CI on the tip | trigger | exit |
+|---|---|---|
+| `success` | `finished` | `10` |
+| queued, running, or no workflow run for the sha yet | *none* — one note, and the poll loop continues | — |
+| any other conclusion (`failure`, `cancelled`, `timed_out`, …) | `finished: CI red on <sha>` | `15` |
+| `gh` could not be read at all | `finished (CI unverified)` | `10` |
+
+*Pending is not news.* CI on a tip pushed seconds ago is queued by definition,
+so the pending case prints one `note:` line in the same shape as the other
+"`finished` cannot fire this poll" notes, and nothing else. No event, no
+evidence block, no suppression record to keep.
+
+*Unreadable is not red, and it is not green.* A `gh` that is missing from
+`PATH`, unauthenticated, rate limited, timed out, or answering with something
+that is not a list of runs has told the watch **nothing about the build**.
+Reading that as failure would invent a red build; reading it as success would
+be the silent overclaim this conjunct exists to remove. So the watch still
+stops — the run is pushed and every batch has stopped, which is as much as it
+can see — under a name that says the CI half is unchecked, and the evidence
+block tells the reader to check it by hand.
+
+*Bounded on purpose.* The `gh` call has a 25-second timeout and is made at
+most once per poll, only once every other condition already holds. A `gh` that
+hangs costs that poll its CI answer — reported as unverified — and never the
+watch. "gh ran fine and lists no run for this sha yet" is a fact about CI
+(nothing has been queued), so it is **pending**; only a failure to *read* an
+answer is unavailable.
 
 *Caveat:* a row stopped by a *dependency* marker (`E3 awaiting E2`) counts as
 stopped, so if the builder finishes the `todo` batches without ever flipping
@@ -384,7 +429,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 160 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 183 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -407,7 +452,18 @@ disarmed and saying so; and both branches of `underway` — a batch **declared**
 by a commit since base, and a batch **in flight** (plan commit pushed, a live
 sub-agent, a dirty tree) with each of those three conjuncts shown to be
 load-bearing, the first `todo` batch named in the run's execution order rather
-than the alphabet, and `applying plan` narrowed to the two plan-commit states.
+than the alphabet, and `applying plan` narrowed to the two plan-commit states;
+and all four CI answers behind `finished` — success fires it, pending does not
+and the watch goes on polling, a non-success conclusion fires `finished: CI
+red on <sha>` with the sha in the event line, and every way of failing to read
+an answer (non-zero exit, empty output, non-JSON, JSON that is not a list, a
+`gh` that hangs past its timeout, and a `gh` that is not on `PATH` at all)
+fires `finished (CI unverified)` rather than claiming green.
+
+Every CI case answers through a **stub `gh`** placed first on `PATH` for the
+whole script, which prints canned JSON and never opens a socket; its default
+is the unavailable branch, so a case that forgets to say what CI said gets the
+unverified answer rather than a call to the real `gh`.
 
 Because the branch is derived, an unset `SPANWEAVE_BRANCH` would make
 `config()` shell out to the *real* repo. `selftest.sh` exports a fixture floor

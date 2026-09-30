@@ -18,6 +18,33 @@ trap 'rm -rf "$TMP"' EXIT
 # deliberately, against a fixture repo of their own.
 export SPANWEAVE_REPO="$TMP/no-such-repo" SPANWEAVE_BRANCH="selftest-floor"
 
+# The same kind of floor for `gh`, which `finished` now asks about the CI
+# conclusion on the pushed tip.  The real `gh` is never run from this script:
+# a stub is first on PATH for every case below, and it answers only from
+# GH_STUB_*.  Its default is the "gh could not tell us anything" branch, so a
+# case that forgets to say what CI said gets the unverified answer rather than
+# a silent network call.
+GHBIN="$TMP/ghbin"; mkdir -p "$GHBIN"
+cat > "$GHBIN/gh" <<'STUB'
+#!/usr/bin/env bash
+# selftest stub for gh - prints canned JSON, never opens a socket.
+[ -n "${GH_STUB_SLEEP:-}" ] && sleep "$GH_STUB_SLEEP"
+[ -n "${GH_STUB_OUT:-}" ] && printf '%s\n' "$GH_STUB_OUT"
+[ -n "${GH_STUB_ERR:-}" ] && printf '%s\n' "$GH_STUB_ERR" >&2
+exit "${GH_STUB_RC:-1}"
+STUB
+chmod +x "$GHBIN/gh"
+export PATH="$GHBIN:$PATH"
+export GH_STUB_RC=1 GH_STUB_OUT="" GH_STUB_ERR="stub gh: no canned answer for this case"
+
+gh_says() {   # gh_says <repo> <status> <conclusion-as-json> - about that repo's HEAD
+  export GH_STUB_RC=0 GH_STUB_ERR=""
+  export GH_STUB_OUT="[{\"headSha\":\"$(git -C "$1" rev-parse HEAD)\",\"status\":\"$2\",\"conclusion\":$3}]"
+}
+gh_unavailable() {  # the default: gh ran and told us nothing usable
+  export GH_STUB_RC=1 GH_STUB_OUT="" GH_STUB_ERR="${1:-could not connect to api.github.com}"
+}
+
 fail=0
 ok()   { printf '  PASS  %s\n' "$1"; }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=1; }
@@ -422,6 +449,7 @@ printf '%s\n' "$out" | grep -q "terminal, watch stops" \
 sed -i 's/^| B3 | thing | todo | 15 |$/| B3 | thing | done | 15 |/' "$R2/WORKPLAN.md"
 git -C "$R2" commit -qam "plan: B3 done"
 git -C "$R2" push -q origin audit-fixes
+gh_says "$R2" completed '"success"'
 out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
        SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
        SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
@@ -474,6 +502,7 @@ printf '%s\n' "$out" | grep -q "open: (none)" \
 
 # (3) with the plan closed and the branch pushed, `finished` is reachable.
 git -C "$R2" push -q origin audit-fixes
+gh_says "$R2" completed '"success"'
 out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
        SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
        SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
@@ -540,6 +569,136 @@ printf '%s\n' "$sout" | grep -q 'active:' \
   && bad "the status report still prints the old 'active:' field" \
   || ok "the status report no longer prints 'active:'"
 sed -i 's/^| B3 | thing | todo | 15 |$/| B3 | thing | done | 15 |/' "$R2/WORKPLAN.md"
+
+# ---------------------------------------------------------------------------
+echo
+echo "finished gates on CI on the pushed tip, in four answers"
+# ---------------------------------------------------------------------------
+# WORKPLAN.md 0.1 step 8: a run is done when the push lands AND CI on the
+# pushed tip is green. `finished` used to fire on the push alone. Every case
+# here answers through the stub gh installed at the top of this file - the
+# real one is never run.
+transcript "Pushed the last batch."
+touch "$BUILDER"
+git -C "$R2" push -q -f origin audit-fixes      # head == origin, every batch stopped
+TIP7="$(git -C "$R2" rev-parse --short HEAD)"
+
+gh_says "$R2" completed '"success"'
+check "CI success on the tip fires finished (exit 10)" "$(run2)" "10|finished"
+grep -q "CI on the pushed tip" "$TMP/last_run.txt" \
+  && ok "the finished block shows the CI evidence it fired on" \
+  || bad "the finished block does not show any CI evidence"
+
+gh_says "$R2" in_progress 'null'
+check "CI still running does not fire, and the watch keeps polling" "$(run2)" "0|"
+grep -q "'finished' cannot fire this poll" "$TMP/last_run.txt" \
+  && ok "the pending poll says why finished did not fire" \
+  || bad "the pending poll is silent about why finished did not fire"
+
+# gh answered and simply has no run for this sha yet. That is a fact about CI
+# (nothing queued) - pending - not a failure to read one.
+export GH_STUB_RC=0 GH_STUB_ERR=""
+export GH_STUB_OUT='[{"headSha":"0000000000000000000000000000000000000000","status":"completed","conclusion":"success"}]'
+check "no workflow run for the tip yet reads as pending, not unavailable" "$(run2)" "0|"
+grep -q "no workflow run for $TIP7 yet" "$TMP/last_run.txt" \
+  && ok "the pending poll says gh has no run for the tip yet" \
+  || bad "the pending poll does not distinguish 'no run yet' from an unreadable answer"
+
+gh_says "$R2" completed '"failure"'
+out="$(run2)"
+check "CI red on the tip is terminal with its own exit code (15)" "${out%%|*}" "15"
+grep -q "^>>> EVENT finished: CI red on $TIP7\$" "$TMP/last_run.txt" \
+  && ok "the CI-red event line names the sha it is red on" \
+  || bad "the CI-red event line does not read 'finished: CI red on <sha>'"
+grep -q "not a substitute" "$TMP/last_run.txt" \
+  && ok "the CI-red block says a local make check is not a substitute" \
+  || bad "the CI-red block does not say why the push is not enough"
+
+# The arming front end has to know the new code too, or a red CI reads as
+# "unexpected exit" - a stop, but one that says the watcher broke.
+mout="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+        SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+        SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+        SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+        "$OPS_DIR/watch_monitor.sh" --run 2 2>&1)"
+check "watch_monitor.sh stops on CI red with its own exit code" "$?" "15"
+printf '%s\n' "$mout" | grep -q "TERMINAL exit=15" \
+  && ok "watch_monitor.sh names CI red as terminal, not unexpected" \
+  || bad "watch_monitor.sh reports CI red as an unexpected exit"
+
+gh_unavailable "could not connect to api.github.com"
+out="$(run2)"
+check "an unreadable gh still fires terminally (exit 10)" "${out%%|*}" "10"
+grep -q "^>>> EVENT finished (CI unverified)\$" "$TMP/last_run.txt" \
+  && ok "an unreadable gh says the CI claim is unverified" \
+  || bad "an unreadable gh claims CI is green"
+grep -q "nothing here has verified CI" "$TMP/last_run.txt" \
+  && ok "the unverified block tells the reader to check CI by hand" \
+  || bad "the unverified block does not say the claim is unchecked"
+
+# Every way of failing to READ an answer, at the function, including the one
+# an end-to-end case cannot stage: gh not on PATH at all.
+python3 - "$R2" "$GHBIN" "$TMP" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import ci_conclusion
+
+repo, ghbin, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+sha = "0123456789abcdef0123456789abcdef01234567"
+empty = os.path.join(tmp, "nobin"); os.makedirs(empty, exist_ok=True)
+bad = 0
+
+
+def c(name, got, want):
+    global bad
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got : %r\n        want: %r" % (name, got, want)); bad = 1
+
+
+def ask(timeout=25, **env):
+    for k, v in env.items():
+        os.environ[k] = v
+    return ci_conclusion(repo, "audit-fixes", sha, timeout=timeout)[0]
+
+
+os.environ["PATH"] = ghbin + os.pathsep + os.environ["PATH"]
+c("gh exiting non-zero is unavailable", ask(GH_STUB_RC="1", GH_STUB_OUT=""), "unavailable")
+c("gh exiting 0 with no output is unavailable",
+  ask(GH_STUB_RC="0", GH_STUB_OUT=""), "unavailable")
+c("gh printing something that is not JSON is unavailable",
+  ask(GH_STUB_RC="0", GH_STUB_OUT="gh: rate limit exceeded"), "unavailable")
+c("gh printing JSON that is not a list of runs is unavailable",
+  ask(GH_STUB_RC="0", GH_STUB_OUT='{"message":"Bad credentials"}'), "unavailable")
+c("a conclusion that is not success is failure, whatever the word",
+  ask(GH_STUB_RC="0",
+      GH_STUB_OUT='[{"headSha":"%s","status":"completed","conclusion":"cancelled"}]' % sha),
+  "failure")
+c("one green and one red run on the tip is failure",
+  ask(GH_STUB_RC="0",
+      GH_STUB_OUT='[{"headSha":"%s","status":"completed","conclusion":"success"},'
+                  '{"headSha":"%s","status":"completed","conclusion":"failure"}]' % (sha, sha)),
+  "failure")
+c("one green and one unconcluded run on the tip is pending",
+  ask(GH_STUB_RC="0",
+      GH_STUB_OUT='[{"headSha":"%s","status":"completed","conclusion":"success"},'
+                  '{"headSha":"%s","status":"queued","conclusion":null}]' % (sha, sha)),
+  "pending")
+# Bounded: a gh that never answers costs one poll, not the watch.
+c("a gh that hangs past the timeout is unavailable, not a wedged poll",
+  ask(timeout=1, GH_STUB_RC="0", GH_STUB_SLEEP="5",
+      GH_STUB_OUT='[{"headSha":"%s","status":"completed","conclusion":"success"}]' % sha),
+  "unavailable")
+os.environ.pop("GH_STUB_SLEEP", None)
+# gh missing from PATH entirely - the one case a stub cannot be.
+os.environ["PATH"] = empty
+c("gh not on PATH at all is unavailable", ci_conclusion(repo, "audit-fixes", sha)[0],
+  "unavailable")
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+gh_unavailable
 
 # ---------------------------------------------------------------------------
 echo

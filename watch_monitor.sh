@@ -8,8 +8,10 @@
 #   `>>> LINE <text>` one-liner, emitted by watch_run.sh - that is every
 #   trigger, terminal or not, and every RESUMED line
 #   WATCHER   - watch_run.sh exited 2 (its own error)
-#   TERMINAL  - watch_run.sh exited on `finished` (10) or `builder gone` (13);
-#               the evidence block has already streamed above it, then exit
+#   TERMINAL  - watch_run.sh exited on `finished` (10, including the
+#               CI-unverified form), `finished: CI red on the tip` (15) or
+#               `builder gone` (13); the evidence block has already streamed
+#               above it, then exit
 #   HEARTBEAT - one line roughly hourly, so a silent death is distinguishable
 #               from a quiet builder
 #
@@ -51,6 +53,7 @@ while :; do
     0)  ;;
     2)  echo "WATCHER exit=2; last poll.log lines:"; tail -20 "$STATE/poll.log"; exit 2 ;;
     10) echo "TERMINAL exit=10 (finished)"; exit 10 ;;
+    15) echo "TERMINAL exit=15 (finished: CI red on the pushed tip)"; exit 15 ;;
     13) echo "TERMINAL exit=13 (builder gone)"; exit 13 ;;
     *)  echo "WATCHER unexpected exit=$rc; last poll.log lines:"
         tail -20 "$STATE/poll.log"; exit "$rc" ;;

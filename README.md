@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 160 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 183 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — all four CI answers behind `finished`, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
 
 ## What you have to pass, and what you do not
 
@@ -145,12 +145,33 @@ skimming that line would have concluded run 3 was underway. It had not started.
 
 ## Per-trigger policy
 
-Only two triggers end the watch. The rest report and keep polling, so a false
-positive costs a paragraph rather than the whole watch.
+Only the finished trigger and `builder gone` end the watch. The rest report
+and keep polling, so a false positive costs a paragraph rather than the whole
+watch.
+
+`finished` asks one more question than "is it pushed?": what CI concluded on
+the pushed tip. `WORKPLAN.md` 0.1 step 8 ends a run at *pushed **and** green*,
+and says a local `make check` is not a substitute. So the answer has four
+shapes, not two — and the three that end the watch say which one they are:
+
+| CI on the tip | what the watch does |
+|---|---|
+| success | fires `finished`, exit `10` |
+| queued / running / no run for the sha yet | does not fire; one note, and the poll loop goes on |
+| any other conclusion | fires `finished: CI red on <sha>`, exit `15` |
+| `gh` could not tell us anything | fires `finished (CI unverified)`, exit `10` |
+
+The last row is the one worth reading twice. A missing, unauthenticated,
+rate-limited or timed-out `gh` is not evidence that CI is red, and it is not
+evidence that CI is green either. The watch stops — the run *is* pushed and
+every batch has stopped — but it says the CI half is unchecked rather than
+printing a `finished` that quietly means "we did not look".
 
 | trigger | stops the watch? | repeats? |
 |---|---|---|
 | **finished** | yes (exit `10`) | — |
+| **finished (CI unverified)** | yes (exit `10`) | — |
+| **finished: CI red on `<sha>`** | yes (exit `15`) | — |
 | **builder gone** | yes (exit `13`) | — |
 | **tripwire** | no | each commit sha once, ever |
 | **waiting on user** | no | once, then suppressed until liveness moves |
@@ -178,7 +199,8 @@ retries.
 | code | meaning |
 |---|---|
 | `0` | invocation ran its budget out; non-terminal events may have been reported |
-| `10` | **finished** — origin moved past base, HEAD matches it, no batch still open |
+| `10` | **finished** — origin moved past base, HEAD matches it, no batch still open, and CI on the tip concluded success. Also the code for **finished (CI unverified)**, where all of that holds but `gh` could not be read |
+| `15` | **finished: CI red on `<sha>`** — the push landed and every batch stopped, but CI on the pushed tip concluded something other than success |
 | `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete. An **empty** arming set cannot shrink, so the trigger has no signal; every poll banner says `no PID set: 'builder gone' disarmed` rather than looking quiet |
 | `2` | watcher error (no builder transcript, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
 

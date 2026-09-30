@@ -2,10 +2,11 @@
 # watch_run.sh - read-only watcher for a spanweave WORKPLAN.md builder session.
 #
 # Polls every POLL_SECONDS (default 300), runs at most BUDGET_SECONDS (default
-# 540) per invocation.  Triggers are report-and-continue except the two
-# terminal ones: `finished` and `builder gone` stop the watch and set the exit
-# code; `tripwire`, `waiting on user` and `stall` print an evidence block,
-# deduplicate themselves against state/watch_state.json, and keep polling.
+# 540) per invocation.  Triggers are report-and-continue except the terminal
+# ones: `finished` - in its plain, CI-red and CI-unverified forms - and
+# `builder gone` stop the watch and set the exit code; `tripwire`, `waiting on
+# user` and `stall` print an evidence block, deduplicate themselves against
+# state/watch_state.json, and keep polling.
 # See WATCH.md for the per-trigger policy.
 #
 # Events are printed between the markers `>>> EVENT <kind>` and
@@ -13,7 +14,8 @@
 # forward them without forwarding per-poll banners.
 #
 # Reads only: git log/status/stash list/fetch/diff --stat/show --stat/rev-parse,
-# file mtimes, pgrep, transcript tails.  Never writes to the repo.  Never runs
+# file mtimes, pgrep, transcript tails, and one bounded `gh run list` for the
+# CI conclusion on the pushed tip.  Never writes to the repo.  Never runs
 # make, uv, or pytest.  Its only writes are under state/.
 #
 # usage: watch_run.sh [--once] [--run N] [--batches "A5 A6 ..."] [--memo "F1"]
@@ -25,7 +27,8 @@
 # arming.sh for why a per-poll reading would disarm two triggers.
 #
 # Exit codes: 0 nothing terminal (non-terminal events may have been printed)
-#             10 finished | 13 builder gone | 2 watcher error
+#             10 finished | 15 finished: CI red on the tip | 13 builder gone
+#             2 watcher error
 # 11 waiting on user, 12 stall and 14 tripwire are printed events, not exits.
 
 set -uo pipefail
@@ -48,7 +51,7 @@ while [ $# -gt 0 ]; do
     --base)    export SPANWEAVE_BASE="$2"; shift 2 ;;
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
-    -h|--help) sed -n '2,29p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,32p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--memo \"F1\"] [--base SHA] [--branch NAME] [--pids \"P P P\"]" >&2; exit 2 ;;
   esac
 done
@@ -65,7 +68,8 @@ while :; do
 import json, os, re, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (STALL_QUIET_S, WAIT_QUIET_S, age, asks_question, claude_processes,
+from watch_lib import (STALL_QUIET_S, WAIT_QUIET_S, age, asks_question, ci_conclusion,
+                       claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, render, resume_note_tail,
@@ -94,7 +98,11 @@ LOG       = os.path.join(STATE_DIR, "poll.log")
 # apart on either threshold.
 
 NONE, FINISHED, WAITING, STALL, GONE, TRIPWIRE, ERROR = 0, 10, 11, 12, 13, 14, 2
-TERMINAL = {FINISHED, GONE, ERROR}
+# A pushed tip whose CI concluded anything but success. Terminal like
+# `finished` and reached from the same place, but a different answer and so a
+# different code: the run stopped, and it did not end green.
+CI_RED = 15
+TERMINAL = {FINISHED, GONE, ERROR, CI_RED}
 
 git = git_in(REPO)
 
@@ -387,25 +395,54 @@ def main():
     # Terminal.
     origin_moved = bool(origin) and bool(basefull) and origin != basefull
     if origin_moved and head == origin and not active:
-        L = []
-        L.append("TRIGGER: finished  (terminal, watch stops)")
-        L.append(header)
-        L.append("")
-        L.append("git log --oneline %s..HEAD:" % BASE)
-        _, log, _ = git("log", "--oneline", "%s..HEAD" % BASE)
-        L.append(log or "  (empty)")
-        L.append("")
-        L.append("Run-%d batch statuses (WORKPLAN.md section 1):" % RUN)
-        L.append(status_block())
-        L.append("")
-        L.append("Resume-note tail:")
-        for line in resume_note_tail(REPO):
-            L.append("  " + line)
-        L.append("")
-        L.append("git status --short:")
-        L.append(statusshort or "  (clean)")
-        event("finished", lines_to_text(L))
-        return FINISHED, events, st
+        # The push is only half of WORKPLAN.md 0.1 step 8; CI green on the
+        # pushed tip is the other half, and a local `make check` is explicitly
+        # not a substitute for it.  So the pushed state decides *whether* to
+        # ask, and CI decides *what the answer is*.
+        ci_state, ci_why = ci_conclusion(REPO, BRANCH, head)
+        if ci_state == "pending":
+            # Not finished yet, and not news either: CI on a tip pushed
+            # seconds ago is queued by definition.  One note, the shape the
+            # other "cannot fire this poll" notes already use, and the loop
+            # goes on polling.
+            print("  note: pushed, every batch stopped, but CI on %s has not concluded"
+                  " (%s) - 'finished' cannot fire this poll" % (headshort, ci_why),
+                  flush=True)
+        else:
+            red = (ci_state == "failure")
+            kind = ("finished: CI red on %s" % headshort if red
+                    else "finished" if ci_state == "success"
+                    else "finished (CI unverified)")
+            L = []
+            L.append("TRIGGER: %s  (terminal, watch stops)" % kind)
+            L.append(header)
+            L.append("")
+            L.append("CI on the pushed tip (gh run list --branch %s):" % BRANCH)
+            L.append("  %s: %s" % (ci_state, ci_why))
+            if ci_state == "unavailable":
+                L.append("  The run is pushed and every batch has stopped, so the watch")
+                L.append("  stops - but nothing here has verified CI. Check it by hand")
+                L.append("  before calling the run done.")
+            elif red:
+                L.append("  The push landed; CI on the tip it landed did not pass, so")
+                L.append("  WORKPLAN.md 0.1 step 8 is not met. A local `make check` is")
+                L.append("  not a substitute for the checks on the pushed sha.")
+            L.append("")
+            L.append("git log --oneline %s..HEAD:" % BASE)
+            _, log, _ = git("log", "--oneline", "%s..HEAD" % BASE)
+            L.append(log or "  (empty)")
+            L.append("")
+            L.append("Run-%d batch statuses (WORKPLAN.md section 1):" % RUN)
+            L.append(status_block())
+            L.append("")
+            L.append("Resume-note tail:")
+            for line in resume_note_tail(REPO):
+                L.append("  " + line)
+            L.append("")
+            L.append("git status --short:")
+            L.append(statusshort or "  (clean)")
+            event(kind, lines_to_text(L))
+            return (CI_RED if red else FINISHED), events, st
 
     # ------------------------------------------------------- WAITING ON USER ---
     # Non-terminal, reported once until liveness moves again.
