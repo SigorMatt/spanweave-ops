@@ -51,8 +51,9 @@ below. `SPANWEAVE_PINNED` is empty by default — there is no pinned transcript.
 
 Each poll prints a one-line banner naming the transcript it is watching, HEAD,
 `origin/<branch>`, the liveness timestamp and its age, the last observed
-`pendingBackgroundAgentCount`, the batches still active, any currently
-suppressed trigger, and — if the arming PID set is empty — that `builder gone`
+`pendingBackgroundAgentCount`, the batches still open — the field is
+`open:`, and `open: (none)` means every listed batch has stopped — any
+currently suppressed trigger, and — if the arming PID set is empty — that `builder gone`
 is disarmed. Banners are appended to `state/poll.log`.
 
 ## Arming
@@ -244,7 +245,7 @@ failure, and the rows are looked for in three places in order:
 |---|---|---|
 | `worktree` | normal | rows as written |
 | `HEAD` | the deletion is staged but not yet committed | rows from the committed copy; the banner says `plan from HEAD` |
-| `absent` | gone from the worktree *and* from `HEAD` | no rows remain, so **nothing counts as active** and `finished` becomes reachable; the banner says `plan from absent` |
+| `absent` | gone from the worktree *and* from `HEAD` | no rows remain, so **nothing counts as open** and `finished` becomes reachable; the banner says `plan from absent` |
 
 A file that *is* there and cannot be read is retried twice (the builder
 rewrites it in place between batches) and only then is a watcher error.
@@ -354,7 +355,7 @@ last 20 entries with type/role and 200-character previews, batch statuses.
 no longer present while the run is incomplete. Which of the `claude
 --dangerous…` processes is the builder is not knowable from outside, so the set
 shrinking is the signal. Evidence: `pgrep -af claude`, the missing PIDs, the
-still-active batches, the last 10 transcript entries, the liveness block.
+still-open batches, the last 10 transcript entries, the liveness block.
 *Note:* if the human restarts sessions for an unrelated reason this fires on a
 stale PID set — just re-arm, and arming takes a fresh set. An empty set
 disarms the trigger; the banner says so every poll.
@@ -383,7 +384,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 155 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 160 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux

@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 155 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — and every dedup path. Touches neither the real repo nor the real transcript directory. |
+| `selftest.sh` | 160 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — and every dedup path. Touches neither the real repo nor the real transcript directory. |
 
 ## What you have to pass, and what you do not
 
@@ -169,7 +169,7 @@ RESUMED after stall (quiet 51.0 min): liveness 02:10:04 -> 03:01:12; HEAD a9f6fd
 
 G4, the last batch, removes `WORKPLAN.md`. The watch reads the rows from the
 working tree, else from `HEAD` while the deletion is staged, else treats the
-plan as **closed** — no rows, nothing active, `finished` reachable. A missing
+plan as **closed** — no rows, nothing open, `finished` reachable. A missing
 plan is never a watcher error; a present-but-unreadable one still is, after two
 retries.
 
@@ -178,7 +178,7 @@ retries.
 | code | meaning |
 |---|---|
 | `0` | invocation ran its budget out; non-terminal events may have been reported |
-| `10` | **finished** — origin moved past base, HEAD matches it, no batch still active |
+| `10` | **finished** — origin moved past base, HEAD matches it, no batch still open |
 | `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete. An **empty** arming set cannot shrink, so the trigger has no signal; every poll banner says `no PID set: 'builder gone' disarmed` rather than looking quiet |
 | `2` | watcher error (no builder transcript, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
 

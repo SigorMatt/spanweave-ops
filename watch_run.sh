@@ -210,7 +210,7 @@ def main():
     # -- per-poll banner -----------------------------------------------------
     suppressed = [k for k in ("waiting", "stall") if st.get(k)]
     banner = ("poll %s | run %d | watching %s%s | HEAD %s | origin %s | liveness %s (%s ago)"
-              " | pendingBackgroundAgentCount=%s | active: %s%s"
+              " | pendingBackgroundAgentCount=%s | open: %s%s"
               % (stamp(now), RUN, tname,
                  "  <-- FOLLOWED (pin was %s)" % PINNED if followed else "",
                  headshort, origin[:7] if origin else "?", stamp(live), age(live, now),
@@ -446,7 +446,7 @@ def main():
         L.append("")
         L.append("PID set from the status check: %s" % " ".join(str(p) for p in PIDSET))
         L.append("missing now                 : %s" % " ".join(str(p) for p in missing_pids))
-        L.append("run %d incomplete, still active: %s" % (RUN, ", ".join(active)))
+        L.append("run %d incomplete, still open: %s" % (RUN, ", ".join(active)))
         L.append("")
         L.append("pgrep -af claude:")
         L.append(pgrep_out or "  (no matches)")
@@ -481,7 +481,7 @@ def main():
             L.append(liveness_block())
             L.append("")
             L.append("pendingBackgroundAgentCount: %s" % pending)
-            L.append("batches still active       : %s" % (", ".join(active) if active else "(none)"))
+            L.append("batches still open         : %s" % (", ".join(active) if active else "(none)"))
             L.append("")
             L.append("git status --short:")
             L.append(statusshort or "  (clean)")

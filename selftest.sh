@@ -468,9 +468,9 @@ check "a committed WORKPLAN.md deletion does not raise a watcher error" \
 printf '%s\n' "$out" | grep -q "plan from absent" \
   && ok "the banner reports the plan as absent" \
   || bad "the banner does not report the plan as absent"
-printf '%s\n' "$out" | grep -q "active: (none)" \
-  && ok "a closed plan leaves no batch active" \
-  || bad "a closed plan still shows an active batch"
+printf '%s\n' "$out" | grep -q "open: (none)" \
+  && ok "a closed plan leaves no batch open" \
+  || bad "a closed plan still shows an open batch"
 
 # (3) with the plan closed and the branch pushed, `finished` is reachable.
 git -C "$R2" push -q origin audit-fixes
@@ -498,6 +498,48 @@ else
   check "a present-but-unreadable plan is still a watcher error" "$?" "2"
 fi
 chmod 644 "$R2/WORKPLAN.md"
+
+# ---------------------------------------------------------------------------
+echo
+echo "the batches-not-yet-stopped field is called 'open:', not 'active:'"
+# ---------------------------------------------------------------------------
+# `active` claimed something the watcher cannot see - that work is happening on
+# a batch. All the field knows is that the row has not stopped yet. The old
+# name is pinned as *absent* from live output so a revert fails here, and the
+# historical lines quoted in README.md, WATCH.md, watch_lib.py and the comment
+# further down this file are deliberately left saying `active:`, because they
+# are records of output that really was printed.
+sed -i 's/^| B3 | thing | done | 15 |$/| B3 | thing | todo | 15 |/' "$R2/WORKPLAN.md"
+transcript "Working on B3."
+touch "$BUILDER"
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+bannerline="$(printf '%s\n' "$out" | grep -m1 '^poll ')"
+printf '%s\n' "$bannerline" | grep -q '| open: B3' \
+  && ok "the poll banner names the open batches in an 'open:' field" \
+  || bad "the poll banner has no 'open:' field: $bannerline"
+printf '%s\n' "$bannerline" | grep -q 'active:' \
+  && bad "the poll banner still prints the old 'active:' field" \
+  || ok "the poll banner no longer prints 'active:'"
+
+sout="$(SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+        SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+        SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+        SPANWEAVE_PIDS="" \
+        "$OPS_DIR/status_check.sh" --run 2 --batches "A5 B3" 2>&1)"
+printf '%s\n' "$sout" | grep -q '2 listed | 1 stopped | 1 open: B3' \
+  && ok "the status report's plan section counts open batches" \
+  || bad "the status report's plan section has no 'open:' field"
+printf '%s\n' "$sout" | grep -q 'batches   : run 2: 1/2 stopped, open: B3' \
+  && ok "the status report's verdict evidence says 'open:'" \
+  || bad "the status report's verdict evidence has no 'open:' field"
+printf '%s\n' "$sout" | grep -q 'active:' \
+  && bad "the status report still prints the old 'active:' field" \
+  || ok "the status report no longer prints 'active:'"
+sed -i 's/^| B3 | thing | todo | 15 |$/| B3 | thing | done | 15 |/' "$R2/WORKPLAN.md"
 
 # ---------------------------------------------------------------------------
 echo

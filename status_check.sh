@@ -153,7 +153,7 @@ missing_rows = [] if plan_src == "absent" else [b for b in BATCHES if b not in s
 if missing_rows:
     print("  note: no section-1 row yet for: %s" % ", ".join(missing_rows))
 print()
-print("  %d listed | %d stopped | %d active: %s"
+print("  %d listed | %d stopped | %d open: %s"
       % (len(BATCHES), len(BATCHES) - len(active), len(active),
          ", ".join(active) if active else "(none)"))
 
@@ -291,7 +291,7 @@ print()
 print("  why       : %s" % why)
 print("  liveness  : %s (%s ago) | transcript %s [%s]"
       % (stamp(live), age(live, now), tname, how))
-print("  batches   : run %d: %d/%d stopped, active: %s"
+print("  batches   : run %d: %d/%d stopped, open: %s"
       % (RUN, len(BATCHES) - len(active), len(BATCHES),
          ", ".join(active) if active else "(none)"))
 print("  declared  : %s" % (", ".join(declared_since_base) or "(none since %s)" % BASE))
