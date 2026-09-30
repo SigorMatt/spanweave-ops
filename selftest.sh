@@ -702,6 +702,116 @@ gh_unavailable
 
 # ---------------------------------------------------------------------------
 echo
+echo "the 'local main moved' tripwire seeds on a new series instead of lying"
+# ---------------------------------------------------------------------------
+# watch_state.json outlives a series. Its main_sha is whatever `main` was
+# during the PREVIOUS one, and `main` has legitimately moved since - the
+# previous series' PR merged. Comparing against it made the first poll of a new
+# series report a merge that happened before the watch was armed.
+R4="$TMP/repo4"; mkdir -p "$R4"
+git -C "$R4" init -q -b main
+git -C "$R4" config user.email t@example.invalid
+git -C "$R4" config user.name Selftest
+cat > "$R4/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L3 | thing | todo | 20 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$R4" add -A
+git -C "$R4" commit -qm "base"
+BASE4="$(git -C "$R4" rev-parse HEAD)"
+git -C "$R4" checkout -q -b live-graphs
+git -C "$R4" commit -q --allow-empty -m "chore: somewhere else to start from"
+BASE4B="$(git -C "$R4" rev-parse HEAD)"
+TD4="$TMP/tdir4"; mkdir -p "$TD4"
+# "Resume WORKPLAN.md" is a builder prompt for any run, so the run number can
+# be varied below without the derivation losing the transcript.
+printf '{"type":"last-prompt","lastPrompt":"Resume WORKPLAN.md after the limit reset"}\n' \
+  > "$TD4/44444444.jsonl"
+ST4="$TMP/state4"; mkdir -p "$ST4"
+
+run4() {  # run4 <run> <branch> <base> -> "<exit>|<event kinds>"
+  local out rc
+  out="$(SPANWEAVE_STATE_DIR="$ST4" SPANWEAVE_REPO="$R4" SPANWEAVE_TDIR="$TD4" \
+         SPANWEAVE_PINNED="" SPANWEAVE_SELF="none.jsonl" \
+         SPANWEAVE_BASE="$3" SPANWEAVE_BRANCH="$2" \
+         SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L3" \
+         "$OPS_DIR/watch_run.sh" --once --run "$1" 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" > "$TMP/last_run4.txt"
+  printf '%s|%s' "$rc" \
+    "$(printf '%s\n' "$out" | sed -n -e 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)"
+}
+move_main() {  # a commit lands on local main, as a merged PR does
+  git -C "$R4" checkout -q main
+  git -C "$R4" commit -q --allow-empty -m "$1"
+  git -C "$R4" checkout -q live-graphs
+}
+state4() {  # state4 <key>
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' \
+    "$ST4/watch_state.json" "$1"
+}
+seeded_not_reported() {  # seeded_not_reported <case name> <expected main sha>
+  grep -q "local main moved: " "$TMP/last_run4.txt" \
+    && bad "$1: reported 'local main moved' on the first poll of a new series" \
+    || ok "$1: no 'local main moved' on the first poll of a new series"
+  grep -q "note: new watch series" "$TMP/last_run4.txt" \
+    && ok "$1: the poll says it seeded main_sha and why" \
+    || bad "$1: the seed is silent, so a reader cannot tell the tripwire is armed"
+  check "$1: main_sha is seeded to the current value" "$(state4 main_sha)" "$2"
+}
+
+# (3) a first-ever poll, with no state at all, behaves as it always did.
+run4 5 live-graphs "$BASE4" > /dev/null
+grep -q "local main moved: " "$TMP/last_run4.txt" \
+  && bad "a first-ever poll reported 'local main moved' against nothing" \
+  || ok "a first-ever poll has nothing to compare and reports nothing"
+check "a first-ever poll seeds main_sha" "$(state4 main_sha)" "$(git -C "$R4" rev-parse main)"
+check "a first-ever poll records the series identity" "$(state4 series)" \
+      "run=5 branch=live-graphs base=$BASE4"
+
+# (1) a PR merges between series, then a new series is armed. The persisted
+# main_sha is now a fact about the previous series only.
+move_main "chore: the run-5 PR merged"
+run4 6 live-graphs "$BASE4" > /dev/null
+seeded_not_reported "a new run number" "$(git -C "$R4" rev-parse main)"
+
+# (2) within that series, a genuine mid-watch move of main still fires.
+move_main "reader: the builder landed this on main mid-watch"
+check "a mid-watch move of main still fires the tripwire" \
+      "$(run4 6 live-graphs "$BASE4")" "0|tripwire"
+grep -q "local main moved: " "$TMP/last_run4.txt" \
+  && ok "the mid-watch hit is the 'local main moved' one" \
+  || bad "the mid-watch tripwire fired on something other than main moving"
+
+# (4) each of the three arming facts is enough on its own to mean "new series".
+move_main "chore: another PR merged between series"
+run4 7 live-graphs "$BASE4" > /dev/null
+seeded_not_reported "the run number alone" "$(git -C "$R4" rev-parse main)"
+move_main "chore: and another"
+run4 7 some-other-branch "$BASE4" > /dev/null
+seeded_not_reported "the watched branch alone" "$(git -C "$R4" rev-parse main)"
+move_main "chore: and one more"
+run4 7 some-other-branch "$BASE4B" > /dev/null
+seeded_not_reported "the base alone" "$(git -C "$R4" rev-parse main)"
+# ...and having seeded, the same series compares again on the very next poll.
+move_main "reader: landed on main inside the re-based series"
+check "the re-based series arms from its second poll" \
+      "$(run4 7 some-other-branch "$BASE4B")" "0|tripwire"
+grep -q "local main moved: " "$TMP/last_run4.txt" \
+  && ok "the second poll of a seeded series compares again" \
+  || bad "the second poll of a seeded series is still seeding"
+
+# ---------------------------------------------------------------------------
+echo
 echo "run-3 shapes - prefix-agnostic ids, and the rows the old regex could not see"
 # ---------------------------------------------------------------------------
 R3D="$TMP/repo3"; mkdir -p "$R3D"

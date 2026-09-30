@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 183 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — all four CI answers behind `finished`, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
+| `selftest.sh` | 202 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — all four CI answers behind `finished`, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
 
 ## What you have to pass, and what you do not
 
@@ -246,6 +246,16 @@ wrong by 2026-09-30, when the repo had moved to `live-graphs`:
 - `DEF_PINNED` — run 2's builder transcript, so every later run reported
   `<-- FOLLOWED off the pin` while the derivation was in fact working. A drift
   notice that fires when nothing has drifted trains the reader to ignore it.
+
+The same mistake had one more home, in `state/`. The tripwire's `local main
+moved` compared against the `main_sha` in `watch_state.json` — which persists
+across series, so on the first poll of a new series it was whatever `main` was
+during the *previous* one. `main` had legitimately moved since (the last
+series' PR merged), so the watch opened by reporting a merge that happened
+before it was armed. A new series now **seeds** that value instead of
+comparing it, and says so in one line; within a series the tripwire is
+unchanged. "New series" is read from the arming identity — run, branch, base —
+persisted alongside it.
 
 All three are derived now, and `selftest.sh` holds each one in place: the
 branch from the checkout and from a detached HEAD, the PID set from a synthetic

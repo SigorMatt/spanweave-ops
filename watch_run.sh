@@ -147,6 +147,15 @@ def main():
     events = []           # (kind, code, text) - printed in order, none terminal
     code = NONE
 
+    # The arming identity of this series: the run number, the branch being
+    # watched, and the base.  state/watch_state.json outlives a series, so a
+    # poll has to be able to tell "the same watch, a few minutes later" from "a
+    # new watch, reading what the last one left behind".  Nothing here is a
+    # guess about the repo - all three come from how the watch was armed.
+    series = "run=%s branch=%s base=%s" % (RUN, BRANCH or "(none)", BASE or "(none)")
+    prev_series = st.get("series")
+    new_series = (prev_series != series)
+
     def event(kind, text):
         events.append((kind, text))
 
@@ -351,8 +360,30 @@ def main():
             conditions[ckey] = True
     else:
         conditions = {k: v for k, v in conditions.items() if not k.startswith("branch:")}
+    # `local main moved` is a MID-WATCH tripwire: it catches the builder landing
+    # work on `main` while a series is being watched.  But watch_state.json
+    # outlives a series, so its `main_sha` is whatever `main` was during the
+    # PREVIOUS one - and `main` has legitimately moved since, because the
+    # previous series' PR merged.  Comparing against it made the first poll of
+    # every new series report a merge that happened before the watch was armed:
+    # a value from a previous run, true then, a lie now - the stale-constant
+    # mistake in the one place left that still made it.
+    #
+    # So the first poll of a new series SEEDS rather than compares.  A series is
+    # identified by what arms it - the run number, the branch being watched, and
+    # the base - and the identity is persisted and compared on load, so "new
+    # series" is a fact about the arming rather than a guess about the shas.
+    # Within a series nothing changes: a genuine mid-watch move of `main` still
+    # fires on the very next poll.
     prev_main = st.get("main_sha")
-    if mainsha and prev_main and mainsha != prev_main:
+    if new_series:
+        print("  note: new watch series (%s; state held %s) - 'local main moved' seeds"
+              " main_sha at %s this poll instead of comparing it with %s, and arms from"
+              " the next poll"
+              % (series, prev_series or "no previous series",
+                 (mainsha or "?")[:7], (prev_main or "nothing")[:7] if prev_main else "nothing"),
+              flush=True)
+    elif mainsha and prev_main and mainsha != prev_main:
         hits.append(("-", "local main moved: %s -> %s" % (prev_main[:7], mainsha[:7])))
     prev_stash = st.get("stash_count")
     if prev_stash is not None and stash_count > prev_stash:
@@ -369,6 +400,7 @@ def main():
     st["last_poll"] = now
     st["transcript"] = tname
     st["run"] = RUN
+    st["series"] = series
 
     if hits:
         L = []

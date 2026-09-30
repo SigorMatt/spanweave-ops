@@ -294,11 +294,32 @@ longer needs the state file deleted. With no `--base`, the range is
   `serialized_shape`
 - the commit **declares** a batch outside the run list
 - the checked-out branch is not the branch this watch was armed on, or local
-  `main` moved
+  `main` moved **within this series** (see below)
 - `git stash list` grew
 
 Evidence: `git show --stat` plus subject and body for each newly reported
 commit, `git status --short`, `git stash list`, current branch, `main` sha.
+
+**`local main moved` is scoped to a series.** It catches the builder landing
+work on `main` *while a watch is running*. But `watch_state.json` outlives a
+series, and its `main_sha` is whatever `main` was during the **previous** one —
+by the time the next series is armed, `main` has legitimately moved, because
+the previous series' PR merged. Comparing against it made the first poll of
+every new series report a merge that happened before the watch existed: a
+value that was true in the run it was written in and a lie in the next one.
+
+So the **first poll of a new series seeds `main_sha` instead of comparing it**,
+and says so in one `note:` line naming both identities and both shas, so a
+reader is never left guessing whether the tripwire is armed. From the second
+poll of that series on, it compares exactly as it always did, and a genuine
+mid-watch move of `main` still fires.
+
+A **series** is identified by what arms it — the run number, the branch being
+watched, and the base — persisted as `series` in `watch_state.json` and
+compared on load. All three are facts about the arming, not guesses about the
+repo, and any one of them differing means a new series. A first-ever poll, with
+no state at all, seeds as it always did. The scope is `main_sha` only:
+`reported_commits` is not touched by this.
 
 **What "declares a batch" means.** Only two forms count:
 
@@ -417,7 +438,10 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 `state/` (gitignored):
 
 - `watch_state.json` — `last_seen_head`, `main_sha`, `stash_count`,
-  `last_poll`, `transcript`, `run`, `reported_commits` (the tripwire's
+  `last_poll`, `transcript`, `run`, `series` (the arming identity — run,
+  branch, base — which is how a poll tells "this watch, later" from "a new
+  watch reading what the last one left"; see the tripwire's `main_sha`
+  seeding), `reported_commits` (the tripwire's
   once-ever list, capped at 500), `reported_conditions` (level-triggered
   tripwire conditions, currently only "wrong branch"), and `waiting` / `stall`
   suppression records (each holds the four signal values at fire time plus
@@ -429,7 +453,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 183 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 202 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -464,6 +488,12 @@ Every CI case answers through a **stub `gh`** placed first on `PATH` for the
 whole script, which prints canned JSON and never opens a socket; its default
 is the unavailable branch, so a case that forgets to say what CI said gets the
 unverified answer rather than a call to the real `gh`.
+
+It also covers the `main_sha` seeding: a stale `main_sha` from a previous
+series is seeded rather than reported, a genuine mid-watch move still fires on
+the next poll, a first-ever poll with no state behaves as it always did, and
+each of the run, the branch and the base is shown to mean "new series" on its
+own.
 
 Because the branch is derived, an unset `SPANWEAVE_BRANCH` would make
 `config()` shell out to the *real* repo. `selftest.sh` exports a fixture floor
