@@ -236,7 +236,14 @@ cat > "$R/WORKPLAN.md" <<'MD'
 
 ---
 MD
-git -C "$R" add -A && git -C "$R" commit -qm "base"
+git -C "$R" add -A
+# The base is authored BEFORE the transcript fixtures above (2026-09-10), which
+# were written when that was "now".  The base-time floor refuses any transcript
+# last written before the base commit's author time, so a base authored today
+# would push this section onto the pin and quietly stop it exercising the
+# derivation at all.  Dating the base restores what the fixture always meant.
+GIT_COMMITTER_DATE="2026-09-09 00:00:00 +0300" GIT_AUTHOR_DATE="2026-09-09 00:00:00 +0300" \
+  git -C "$R" commit -qm "base"
 BASE="$(git -C "$R" rev-parse HEAD)"
 git -C "$R" remote add origin "$R/../remote.git"
 git -C "$R" init -q --bare "$TMP/remote.git" 2>/dev/null || git init -q --bare "$TMP/remote.git"
@@ -953,6 +960,276 @@ case "$got" in
   351ac45a*) bad "the watcher derived onto its own session file" ;;
   *)         ok  "with the builder id as the live session, it is not chosen" ;;
 esac
+
+# ---------------------------------------------------------------------------
+echo
+echo "the base-time floor - a transcript older than the base is not the builder's"
+# ---------------------------------------------------------------------------
+# 2026-10-01: a run-3 watch of the `live-graphs` series derived onto
+# 351ac45a-...jsonl - the SEPTEMBER audit series' run 3 - and reported that dead
+# session's liveness, then `finished`. Run numbers are PER-SERIES, so every
+# prompt predicate said yes; the file's own mtime was 2026-09-11 00:37 and its
+# subagents/ 2026-09-10 17:09, twenty days before the base commit (ce9ff17,
+# authored 2026-10-01 00:23:40) the watch was armed on. The real builder
+# (1d41a6d1-...jsonl) was not a candidate at all: its stored lastPrompt is cut
+# at ~200 characters and the only run number inside the cut is 2, so the phrase
+# that named run 3 was never stored. One candidate, so it won outright - the
+# (subagents, own) ordering never got a chance to prefer the newer session.
+LP351='Apply ~/Downloads/run3-2026-09-11.md with one plan-only sub-agent (recreate WORKPLAN.md from git show c79cbc5:WORKPLAN.md, restore its README row, single commit plan: reopen for run 3 -- run-2 review…'
+LP1D4='In ~/git/spanweave on live-graphs (tip 2cde61f), read WORKPLAN.md §0 in full. Apply patches/decisions-live-2026-09-30.md exactly as its header says: one plan-only sub-agent, one commit plan: run-2 rev…'
+
+R7="$TMP/repo7"; mkdir -p "$R7"
+git -C "$R7" init -q -b live-graphs
+git -C "$R7" config user.email t@example.invalid
+git -C "$R7" config user.name Selftest
+# The real base's author time, to the second.
+GIT_COMMITTER_DATE="2026-10-01 00:23:40 +0300" GIT_AUTHOR_DATE="2026-10-01 00:23:40 +0300" \
+  git -C "$R7" commit -q --allow-empty -m "plan: reopen for run 3"
+BASE7="$(git -C "$R7" rev-parse HEAD)"
+# The same history with an earlier base, so the counter-check can move the floor
+# instead of the prompt: author time is what the floor reads, and git is happy
+# for a later commit to carry an earlier author date.
+GIT_COMMITTER_DATE="2026-10-01 00:30:00 +0300" GIT_AUTHOR_DATE="2026-09-01 00:00:00 +0300" \
+  git -C "$R7" commit -q --allow-empty -m "chore: authored in September"
+BASE7EARLY="$(git -C "$R7" rev-parse HEAD)"
+
+mkT() {  # mkT <dir> <uuid> <lastPrompt>
+  mkdir -p "$1"
+  printf '{"type":"last-prompt","lastPrompt":%s}\n' \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$3")" > "$1/$2.jsonl"
+}
+deriveF() {  # deriveF <tdir> <base> <run> [pin] -> "<name>|<how>"; rejected rows to $TMP/derF.txt
+  SPANWEAVE_REPO="$R7" SPANWEAVE_TDIR="$1" SPANWEAVE_BASE="$2" SPANWEAVE_RUN="$3" \
+  SPANWEAVE_PINNED="${4:-}" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" python3 - <<'PY' > "$TMP/derF.txt"
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, derive_transcript
+name, lp, cands, how, rej = derive_transcript(config())
+print("%s|%s" % (name, how))
+for n, w in rej:
+    print("rejected %s  %s" % (n, w))
+PY
+  head -1 "$TMP/derF.txt"
+}
+
+# (1) the prompt is a perfectly good run-3 builder prompt. That is the point:
+#     the floor is not a second opinion about the prompt.
+check "the September run-3 prompt is still a builder prompt for run 3" \
+      "$(SPANWEAVE_RUN=3 python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import is_builder_prompt
+print(is_builder_prompt(sys.argv[1], 3))' "$LP351")" "True"
+
+TD7="$TMP/tdir7"; mkT "$TD7" 351ac45a "$LP351"
+mkdir -p "$TD7/351ac45a/subagents"; : > "$TD7/351ac45a/subagents/a.jsonl"
+touch -d '2026-09-10 17:09:59' "$TD7/351ac45a/subagents/a.jsonl" "$TD7/351ac45a/subagents"
+touch -d '2026-09-11 00:37:31' "$TD7/351ac45a.jsonl"
+check "a transcript last written before the base is refused, prompt and all" \
+      "$(deriveF "$TD7" "$BASE7" 3)" "None|none (older than base)"
+grep -q 'rejected 351ac45a.jsonl .*2026-09-11 00:37:31.*predates the base' "$TMP/derF.txt" \
+  && ok "the rejection names the transcript's last write" \
+  || bad "the rejection does not name the transcript's last write"
+grep -q "predates the base commit's author time 2026-10-01 00:23:40" "$TMP/derF.txt" \
+  && ok "the rejection names the base commit's author time too" \
+  || bad "the rejection does not name the base commit's author time"
+
+# (2) the counter-check: move the floor, not the prompt, and the same file wins.
+check "the same transcript is accepted against a base authored before it" \
+      "$(deriveF "$TD7" "$BASE7EARLY" 3)" "351ac45a.jsonl|derived"
+
+# (3) a pin is an operator override and is not floor-tested, exactly as it is
+#     not re-tested against the run number.
+check "a pin is honoured without being floor-tested" \
+      "$(deriveF "$TD7" "$BASE7" 3 351ac45a.jsonl)" "351ac45a.jsonl|pin (no candidate)"
+
+# (4) both mtimes are consulted. "Last write" is the NEWER of the transcript's
+#     own mtime and its subagents/ dir mtime, which is the reading least likely
+#     to exclude a live builder whose own file has not flushed yet.
+TD7B="$TMP/tdir7b"; mkT "$TD7B" dddddddd "Resume WORKPLAN.md run 3"
+mkdir -p "$TD7B/dddddddd/subagents"; : > "$TD7B/dddddddd/subagents/a.jsonl"
+touch -d '2026-09-20 00:00:00' "$TD7B/dddddddd.jsonl"
+touch -d '2026-10-01 10:00:00' "$TD7B/dddddddd/subagents/a.jsonl" "$TD7B/dddddddd/subagents"
+check "an old own mtime with a subagents/ dir newer than base is kept" \
+      "$(deriveF "$TD7B" "$BASE7" 3)" "dddddddd.jsonl|derived"
+touch -d '2026-09-20 00:00:00' "$TD7B/dddddddd/subagents/a.jsonl" "$TD7B/dddddddd/subagents"
+check "with the subagents/ dir old too, the same transcript is refused" \
+      "$(deriveF "$TD7B" "$BASE7" 3)" "None|none (older than base)"
+
+# (5) the real builder's own rejection is the truncated prompt, not the floor -
+#     its last write is newer than the base, and it is still not a candidate.
+TD7C="$TMP/tdir7c"; mkT "$TD7C" 1d41a6d1 "$LP1D4"
+touch -d '2026-10-01 15:49:31' "$TD7C/1d41a6d1.jsonl"
+check "the real builder's truncated lastPrompt refuses it, and the floor does not" \
+      "$(deriveF "$TD7C" "$BASE7" 3)" "None|none"
+grep -q 'rejected 1d41a6d1.jsonl .*names no operative run 3 (names run 2).*truncated at the stored cap' \
+     "$TMP/derF.txt" \
+  && ok "the rejection names the truncation and the run it does name" \
+  || bad "the rejection does not name the truncation"
+
+# (6) with both present the two rejections are distinguishable, which is the
+#     whole evidence of the 2026-10-01 drift in one list.
+TD7D="$TMP/tdir7d"; mkT "$TD7D" 351ac45a "$LP351"; mkT "$TD7D" 1d41a6d1 "$LP1D4"
+touch -d '2026-09-11 00:37:31' "$TD7D/351ac45a.jsonl"
+touch -d '2026-10-01 15:49:31' "$TD7D/1d41a6d1.jsonl"
+check "neither transcript is chosen, and the floor is the reported reason" \
+      "$(deriveF "$TD7D" "$BASE7" 3)" "None|none (older than base)"
+check "the two rejections are distinguishable in the rejected list" \
+      "$(grep -c -e 'rejected 351ac45a.jsonl .*predates the base' \
+                 -e 'rejected 1d41a6d1.jsonl .*truncated at the stored cap' "$TMP/derF.txt")" \
+      "2"
+
+# ---------------------------------------------------------------------------
+echo
+echo "no transcript newer than base - liveness is unknown, and the stall says so"
+# ---------------------------------------------------------------------------
+R8="$TMP/repo8"; mkdir -p "$R8"
+git -C "$R8" init -q -b live-graphs
+git -C "$R8" config user.email t@example.invalid
+git -C "$R8" config user.name Selftest
+cat > "$R8/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L9 | thing | todo | 20 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$R8" add -A
+GIT_COMMITTER_DATE="$(date -d '-90 min' -R)" GIT_AUTHOR_DATE="$(date -d '-90 min' -R)" \
+  git -C "$R8" commit -qm "base"
+BASE8="$(git -C "$R8" rev-parse HEAD)"
+git init -q --bare "$TMP/remote8.git"
+git -C "$R8" remote add origin "$TMP/remote8.git"
+git -C "$R8" push -q origin live-graphs
+# Nothing has landed for 85 minutes. With liveness unknown, THIS and the index
+# mtime are the whole stall rule.
+GIT_COMMITTER_DATE="$(date -d '-85 min' -R)" GIT_AUTHOR_DATE="$(date -d '-85 min' -R)" \
+  git -C "$R8" commit -q --allow-empty -m "chore: nothing since"
+
+TD8="$TMP/tdir8"
+# A September builder, exactly the 351ac45a shape, weeks older than the base.
+mkT "$TD8" 351ac45a "$LP351"
+touch -d '2026-09-11 00:37:31' "$TD8/351ac45a.jsonl"
+# An aux session that is NOT a candidate at any date - the decoy whose mtime
+# moves below, to prove a transcript the watch is not watching cannot resume it.
+mkT "$TD8" 29d210c7 "Review WORKPLAN.md run 3 commits since the base"
+ST8="$TMP/state8"; mkdir -p "$ST8"
+INDEX_AT8="$(date -d '-90 min' '+%Y-%m-%d %H:%M:%S')"
+
+run8() {  # run8 [pin] [state-dir] -> "<exit>|<event kinds>"
+  local out rc
+  touch -d "$INDEX_AT8" "$R8/.git/index"
+  out="$(SPANWEAVE_STATE_DIR="${2:-$ST8}" SPANWEAVE_REPO="$R8" SPANWEAVE_TDIR="$TD8" \
+         SPANWEAVE_PINNED="${1:-}" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+         SPANWEAVE_BASE="$BASE8" SPANWEAVE_BRANCH=live-graphs \
+         SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L9" \
+         "$OPS_DIR/watch_run.sh" --once --run 3 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" > "$TMP/last_run8.txt"
+  printf '%s|%s' "$rc" \
+    "$(printf '%s\n' "$out" | sed -n -e 's/^>>> EVENT \(.*\)$/\1/p' \
+                                    -e 's/^>>> LINE \(RESUMED\).*$/\1/p' | paste -sd, -)"
+}
+
+check "no candidate newer than base is not a watcher error: the stall fires" \
+      "$(run8)" "0|stall"
+grep -q '^poll .*| liveness: unknown (no transcript newer than base) |' "$TMP/last_run8.txt" \
+  && ok "the banner says liveness is unknown instead of printing an age" \
+  || bad "the banner does not say liveness is unknown"
+grep -qE '^poll .*liveness (2026|[0-9]{4}-)' "$TMP/last_run8.txt" \
+  && bad "the banner still prints a liveness timestamp" \
+  || ok "the banner prints no borrowed liveness timestamp"
+grep -q '(0.0 min ago)' "$TMP/last_run8.txt" \
+  && bad "the output invents a 0.0 min age" || ok "the output invents no age"
+grep -q 'arming: liveness is unknown for base' "$TMP/last_run8.txt" \
+  && ok "arming says liveness is unknown for this base" \
+  || bad "arming does not say liveness is unknown"
+grep -q 'the stall rule runs on the commit and .git/index times alone' "$TMP/last_run8.txt" \
+  && ok "arming says what the stall rule runs on instead" \
+  || bad "arming does not say what the stall rule runs on"
+grep -q 'it is excluded from the rule - it neither armed' "$TMP/last_run8.txt" \
+  && ok "the stall block says liveness is excluded, not quiet" \
+  || bad "the stall block does not say liveness is excluded"
+grep -q 'refused: 351ac45a.jsonl .*predates the base' "$TMP/last_run8.txt" \
+  && ok "the evidence block shows the near miss rather than hiding it" \
+  || bad "the evidence block hides the refused transcript"
+
+check "the stall is suppressed on the same schedule as a normal one" \
+      "$(run8)" "0|"
+# A transcript moving on disk while liveness is unknown is not a resume: the
+# watch is not watching one, so there is nothing for it to have moved.
+touch "$TD8/29d210c7.jsonl"
+check "a liveness-only movement emits no RESUMED while liveness is unknown" \
+      "$(run8)" "0|"
+python3 - "$ST8/watch_state.json" <<'PY'
+import json, sys, time
+st = json.load(open(sys.argv[1]))
+if "stall" not in st:
+    print("  FAIL  no stall record to age in the unknown-liveness state"); sys.exit(1)
+st["stall"]["fired_at"] = time.time() - 41 * 60
+json.dump(st, open(sys.argv[1], "w"), indent=2, sort_keys=True)
+PY
+[ $? -eq 0 ] || fail=1
+check "and it repeats after a further 40 min, like a normal stall" \
+      "$(run8)" "0|stall"
+grep -q 'TRIGGER: stall (still,' "$TMP/last_run8.txt" \
+  && ok "the repeat says it is a repeat" || bad "the repeat does not say so"
+
+# A pin overrides the floor, so liveness becomes observable again - the ancient
+# timestamp is printed as what it is, not hidden and not called unknown.
+ST8B="$TMP/state8b"; mkdir -p "$ST8B"
+check "a pin is still honoured, and liveness stops being unknown" \
+      "$(run8 351ac45a.jsonl "$ST8B")" "0|stall"
+grep -q 'liveness 2026-09-11 00:37:31' "$TMP/last_run8.txt" \
+  && ok "the pinned watch prints the pinned transcript's real liveness" \
+  || bad "the pinned watch does not print the pinned transcript's liveness"
+grep -q 'liveness: unknown' "$TMP/last_run8.txt" \
+  && bad "the pinned watch still calls liveness unknown" \
+  || ok "the pinned watch does not call liveness unknown"
+
+# ---------------------------------------------------------------------------
+echo
+echo "pendingBackgroundAgentCount comes from the chosen transcript and no other"
+# ---------------------------------------------------------------------------
+# It feeds `batch_running` in the stall rule and the in-flight verdict, so a
+# count read from a second transcript would report another session's sub-agent
+# as this run's activity - and would suppress a stall on evidence about a
+# session the watch is not watching.
+TD9="$TMP/tdir9"; mkdir -p "$TD9"
+mkT9() {  # mkT9 <uuid> <lastPrompt> <pendingBackgroundAgentCount>
+  { printf '{"type":"last-prompt","lastPrompt":%s}\n' \
+      "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$2")"
+    printf '{"type":"system","timestamp":"2026-10-01T12:00:00.000Z","content":"ok","pendingBackgroundAgentCount":%s}\n' "$3"
+  } > "$TD9/$1.jsonl"
+}
+mkT9 11111111 "Resume WORKPLAN.md run 3" 0
+# Newer, and loudly claiming an outstanding sub-agent - but an aux prompt, so
+# never a candidate. If a count ever leaked across transcripts, it would be 7.
+mkT9 29d210c7 "Review WORKPLAN.md run 3 commits since the base" 7
+ST9="$TMP/state9"; mkdir -p "$ST9"
+out9="$(SPANWEAVE_STATE_DIR="$ST9" SPANWEAVE_REPO="$R8" SPANWEAVE_TDIR="$TD9" \
+        SPANWEAVE_PINNED="" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+        SPANWEAVE_BASE="$BASE8" SPANWEAVE_BRANCH=live-graphs \
+        SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L9" \
+        "$OPS_DIR/watch_run.sh" --once --run 3 2>&1)"
+check "the watch derives onto the builder, not the newer aux session" \
+      "$(printf '%s\n' "$out9" | sed -n 's/^poll .*watching \([^ |]*\).*/\1/p')" \
+      "11111111.jsonl"
+check "the banner reports the chosen transcript's count, not the decoy's" \
+      "$(printf '%s\n' "$out9" | sed -n 's/^poll .*pendingBackgroundAgentCount=\([^ |]*\).*/\1/p')" \
+      "0"
+sout9="$(SPANWEAVE_REPO="$R8" SPANWEAVE_TDIR="$TD9" \
+         SPANWEAVE_PINNED="" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+         SPANWEAVE_BASE="$BASE8" SPANWEAVE_BRANCH=live-graphs SPANWEAVE_PIDS="" \
+         "$OPS_DIR/status_check.sh" --run 3 --batches "L9" 2>&1)"
+check "the status report reads it from the chosen transcript too" \
+      "$(printf '%s\n' "$sout9" | sed -n 's/^ *pendingBackgroundAgentCount: //p')" "0"
 
 # ---------------------------------------------------------------------------
 echo

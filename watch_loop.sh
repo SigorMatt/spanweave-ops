@@ -15,6 +15,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SPANWEAVE_OPS_DIR="$HERE"
 
 . "$HERE/arming.sh"
+# The base out of argv, so arming's liveness note is about the base this watch
+# is actually armed on: arming runs before `watch_run.sh` ever sees these flags.
+spanweave_export_base "$@"
 spanweave_arm
 
 while :; do

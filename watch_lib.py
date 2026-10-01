@@ -266,14 +266,20 @@ def declared_batches(subject, body):
 #
 #   * is a builder prompt for run N (see `is_builder_prompt`), and
 #   * names no run number other than N, and
-#   * is not this session's transcript, nor a known past watcher/aux one.
+#   * is not this session's transcript, nor a known past watcher/aux one,
+#   * and whose LAST WRITE is not earlier than the base commit's author time
+#     (the floor - see `derive_transcript`; run numbers are per-series, so a
+#     prompt test alone cannot tell September's run 3 from October's).
 #
 # Among candidates: newest `<stem>/subagents/` directory mtime wins, then the
 # transcript's own mtime.  With no candidate the configured pin is used - an
-# operator override, so it is not re-tested against the run number.
+# operator override, so it is re-tested against neither the run number nor the
+# floor.
 #
 # Under this rule the 95360def drift cannot recur: its lastPrompt names run 1,
-# so it is excluded from a run-2 watch by rule 2 whatever its mtime.
+# so it is excluded from a run-2 watch by rule 2 whatever its mtime.  Nor can
+# the 351ac45a drift: it is a run-3 builder prompt, and the floor refuses it
+# anyway because it was last written twenty days before the base commit.
 
 LP_RE = re.compile(r'"lastPrompt"\s*:\s*"((?:[^"\\]|\\.)*)"')
 # Two regexes, because naming a run and *being about* a run are different
@@ -376,14 +382,131 @@ def subagents_dir(tdir, name):
     return os.path.join(tdir, name[:-6], "subagents")
 
 
+# The stored `lastPrompt` is capped at about 200 characters, with a trailing
+# "…" where it was cut.  That cap is half of why the 2026-10-01 drift below
+# happened, so a prompt that is *about* the plan but names no operative run N
+# while sitting at the cap is reported as a near miss rather than dropped in
+# silence: the phrase that names the run may lie beyond the cut, and it did.
+TRUNC_LEN = 200
+
+
+def truncated_prompt(lp):
+    """Is this stored lastPrompt cut off at the cap?"""
+    lp = lp or ""
+    return lp.rstrip().endswith("…") or len(lp) >= TRUNC_LEN
+
+
+def base_author_time(repo, base):
+    """The base commit's AUTHOR time as an epoch, or None if it cannot be read.
+
+    Author time, not committer time: a rebase, an amend or a cherry-pick
+    rewrites the committer time to *now*, which would drag the floor forward
+    over work the run already contains and disqualify the live builder.  The
+    author time is when the base was written, which is the thing the floor is
+    actually asking about.
+
+    None when the base is empty, unresolvable, or the path is not a repo - and
+    then there is no floor at all.  A watch cannot invent a bound it could not
+    read.
+    """
+    if not base:
+        return None
+    rc, out, _ = git_in(repo)("log", "-1", "--format=%at", base)
+    if rc != 0:
+        return None
+    try:
+        return int(out.strip().splitlines()[0])
+    except Exception:                          # noqa: BLE001
+        return None
+
+
+def last_write(tdir, name):
+    """-> (last_write, own_mtime, subagents_dir_mtime) for one transcript.
+
+    "Last write" is the **newer of** the transcript's own mtime and its
+    `<stem>/subagents/` directory mtime.  Of the readings available this is the
+    conservative one - the one least likely to exclude a *live* builder: a
+    builder's own file can sit unflushed for minutes while a batch sub-agent
+    runs, and the directory mtime moves when that sub-agent's file is created.
+    Taking the own mtime alone would refuse a working builder; taking the newer
+    of the two cannot.
+
+    The directory's own mtime is used, not the recursive `newest_under` that
+    *liveness* uses, so this matches the derivation tiebreak exactly - the same
+    two numbers that order the candidates are the two that bound them.
+    """
+    own = mtime(os.path.join(tdir, name))
+    sub = mtime(subagents_dir(tdir, name))
+    return max(own or 0.0, sub or 0.0), own, sub
+
+
+# `how` values `derive_transcript` returns.  HOW_FLOOR is not an error: it says
+# every transcript this run could have derived onto was last written before the
+# base commit, so the builder's session is not visible from here *yet*.  The
+# callers degrade to "liveness unknown" on it rather than exiting.
+HOW_DERIVED = "derived"
+HOW_PIN     = "pin (no candidate)"
+HOW_NONE    = "none"
+HOW_FLOOR   = "none (older than base)"
+
+
+def liveness_unknown_for_base(cfg):
+    """-> (unknown, base_at, rejected) - what `arming.sh` says once, up front.
+
+    `unknown` is True exactly when the derivation ends in HOW_FLOOR: candidates
+    existed for this run and the floor refused every one of them, and no pin
+    overrode it.  It asks the derivation rather than approximating it with a
+    cheaper stat sweep, because a note that disagreed with the banners it
+    precedes would be worse than no note: "newest transcript in the directory"
+    is not the same question as "newest *candidate* for this run", and the
+    directory is full of aux sessions that are newer than any base.  One extra
+    derivation per *arming* - not per poll - is what that costs.
+    """
+    _name, _lp, _cands, how, rejected = derive_transcript(cfg)
+    return how == HOW_FLOOR, base_author_time(cfg["repo"], cfg["base"]), rejected
+
+
 def derive_transcript(cfg):
-    """-> (name, lastPrompt, candidates, how)
+    """-> (name, lastPrompt, candidates, how, rejected)
 
     candidates is a list of (sub_mtime, own_mtime, name, lastPrompt), best
-    first.  `how` is "derived", "pin (no candidate)" or "none"."""
+    first.  `how` is one of HOW_DERIVED, HOW_PIN, HOW_FLOOR or HOW_NONE."""
     run = cfg["run"]
     mine = self_names(cfg)
-    cands, rejected = [], []
+    # The base-time floor.  A transcript whose last write predates the base
+    # commit's author time cannot be the builder's for this run: the run had
+    # not started when that session last wrote.  It is applied below to every
+    # candidate, before any ordering, and whatever its lastPrompt says.
+    #
+    # Why it exists, 2026-10-01: a run-3 watch of the `live-graphs` series
+    # derived onto `351ac45a-...jsonl`, own mtime 2026-09-11 00:37 and
+    # `subagents/` 2026-09-10 17:09 - twenty days before the run it was
+    # watching - and reported that dead session's liveness, then `finished`,
+    # against a base (`ce9ff17`) authored 2026-10-01 00:23:40.  Two independent
+    # causes met:
+    #
+    #   * RUN NUMBERS ARE PER-SERIES.  351ac45a is the *September audit
+    #     series'* run 3 ("Apply ~/Downloads/run3-2026-09-11.md ... single
+    #     commit plan: reopen for run 3 -- run-2 review findings"), so every
+    #     prompt predicate says yes: not aux in its first 80 characters, names
+    #     WORKPLAN.md, names run 3 operatively, spared by rule 2 because it
+    #     names run 3 itself.  Nothing in the derivation knows about series or
+    #     about recency, and a run number alone cannot tell two series apart.
+    #   * THE STORED `lastPrompt` IS TRUNCATED at ~200 characters.  The real
+    #     run-3 builder (`1d41a6d1-...jsonl`, own mtime 2026-10-01 15:49,
+    #     `subagents/` 2026-10-01 01:20) stored "In ~/git/spanweave on
+    #     live-graphs (tip 2cde61f), read WORKPLAN.md §0 in full. Apply
+    #     patches/decisions-live-2026-09-30.md exactly as its header says: one
+    #     plan-only sub-agent, one commit plan: run-2 rev…" - the only run
+    #     number inside the cut is 2, so `run_token_re(3)` is False and it is
+    #     not a candidate.  The phrase that named run 3 lay beyond the cut.
+    #
+    # So the wrong transcript was the *only* candidate and won outright; the
+    # (subagents mtime, own mtime) ordering never got a chance to prefer the
+    # newer session.  The floor is what the ordering could not do: a date is a
+    # fact about this run, where a run number is only a fact about some run.
+    base_at = base_author_time(cfg["repo"], cfg["base"])
+    cands, rejected, floored = [], [], False
     for path in sorted(glob.glob(os.path.join(cfg["tdir"], "*.jsonl"))):
         name = os.path.basename(path)
         lp = last_prompt(path)
@@ -397,6 +520,23 @@ def derive_transcript(cfg):
         if not lp:
             continue
         if not is_builder_prompt(lp, run):
+            # One near miss is worth printing: a prompt about the plan, not an
+            # aux one, naming no operative run N - and cut off at the stored
+            # cap, so the run number may be in the part that was not kept.
+            # That is exactly how the real run-3 builder was passed over on
+            # 2026-10-01 (see the note above), and it is a different rejection
+            # from the floor's, so the two are distinguishable in this list.
+            # Prompts that are short enough to be whole are not listed: they
+            # really do not name the run, and the directory holds dozens.
+            if (lp and not is_aux_prompt(lp) and PLAN_RE.search(lp)
+                    and truncated_prompt(lp)):
+                named = sorted(set(int(x) for x in RUNNUM_RE.findall(lp)))
+                rejected.append(
+                    (name, "lastPrompt is about WORKPLAN.md but names no operative "
+                           "run %d (%s); it is %d chars, truncated at the stored cap, "
+                           "so a later 'run %d' would not be stored"
+                     % (run, "names run %s" % ", ".join(str(x) for x in named)
+                        if named else "names no run at all", len(lp), run)))
             continue
         # Rule 2, and the same citation/declaration distinction as rule (a):
         # a run number the prompt *also* mentions is only disqualifying when
@@ -411,20 +551,52 @@ def derive_transcript(cfg):
             rejected.append((name, "lastPrompt names run %s, never run %d"
                              % (", ".join(str(x) for x in other), run)))
             continue
-        cands.append((mtime(subagents_dir(cfg["tdir"], name)) or 0.0,
-                      mtime(path) or 0.0, name, lp))
+        lw, own_m, sub_m = last_write(cfg["tdir"], name)
+        if base_at is not None and lw < base_at:
+            # The floor.  Reported, not dropped: this is the near miss, and a
+            # reader has to be able to see which file nearly won and by how
+            # many days it missed.
+            floored = True
+            rejected.append(
+                (name, "last write %s (own %s, subagents/ %s) predates the base "
+                       "commit's author time %s - the run had not started"
+                 % (stamp(lw), stamp(own_m), stamp(sub_m), stamp(base_at))))
+            continue
+        cands.append((sub_m or 0.0, own_m or 0.0, name, lp))
+    # The ordering is unchanged, and is the implementation of "among surviving
+    # candidates, the newest write wins": `subagents/` mtime first, then the
+    # transcript's own mtime, then the name.  A `subagents/` directory is only
+    # written by a builder that is *orchestrating* - it is the stronger signal
+    # of the two, so it is read first rather than averaged with the other.
+    #
+    # The two readings diverge in exactly one case: a candidate with a newer
+    # own mtime and NO `subagents/` directory loses to one with a newer
+    # `subagents/` directory and an older own mtime.  That outcome is the
+    # preferred one - the orchestrating session is the builder, and its own file
+    # goes quiet for minutes at a time precisely while its sub-agent works, so
+    # "newest own mtime" would hand the watch to a session that typed one line.
+    # `selftest.sh` pins it ("a newer transcript still loses to a newer
+    # subagents/ dir").  Both candidates have already cleared the floor, so
+    # neither can be a previous series' session.
     cands.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
     if cands:
-        return cands[0][2], cands[0][3], cands, "derived", rejected
+        return cands[0][2], cands[0][3], cands, HOW_DERIVED, rejected
     # There is no default pin any more, so this branch is reached only when an
-    # operator passed one.  With neither a candidate nor a pin the answer is
-    # "no builder transcript for this run", which the callers report as a
-    # watcher error rather than guessing at a file.
+    # operator passed one.  The pin is an operator override and is NOT re-tested
+    # against the floor, exactly as it is already not re-tested against the run
+    # number: an operator who names a file has said something the watcher's
+    # evidence cannot outvote.
     if cfg["pinned"]:
         pin = os.path.join(cfg["tdir"], cfg["pinned"])
         if os.path.exists(pin):
-            return cfg["pinned"], last_prompt(pin), cands, "pin (no candidate)", rejected
-    return None, None, cands, "none", rejected
+            return cfg["pinned"], last_prompt(pin), cands, HOW_PIN, rejected
+    # No candidate and no pin.  The two ways of getting here are different
+    # answers and must not be reported as the same one: HOW_FLOOR means
+    # candidates existed and the floor refused them all, so liveness is unknown
+    # for this base and the watch degrades honestly; HOW_NONE means nothing in
+    # the directory was ever a candidate, which is the watcher error it always
+    # was.
+    return None, None, cands, (HOW_FLOOR if floored else HOW_NONE), rejected
 
 
 # ------------------------------------------------------------ transcript tails
@@ -540,6 +712,20 @@ def limit_notice(entries, n=30):
 
 
 def pending_agents(entries):
+    """The last `pendingBackgroundAgentCount` in a `system` entry of `entries`.
+
+    ONE transcript's entries, always: both callers pass `tail_entries` of the
+    transcript the derivation (or the pin) chose, and nothing here or in them
+    unions counts across transcripts.  It has to stay that way.  The count is
+    read as evidence that *this* builder has a batch sub-agent outstanding, and
+    it feeds `stall` (via `batch_running`) and the `underway (in flight)`
+    verdict; a count borrowed from some other session in the directory would
+    report another run's sub-agent as this run's activity, and would suppress a
+    stall on evidence about a session the watch is not watching.  The 2026-10-01
+    drift was one derivation away from doing exactly that.  `selftest.sh` keeps
+    a decoy transcript with a count of 7 in the fixture directory and pins that
+    the watch reports the chosen transcript's 0.
+    """
     val = None
     for e in entries:
         if e.get("type") == "system":
@@ -688,7 +874,10 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
       statuses            {batch id: status} from WORKPLAN.md section 1
       source              "worktree" | "HEAD" | "absent" | "unreadable"
       batches             the run's batch list, in section 2's execution order
-      how                 "derived" | "pin (no candidate)" | "none"
+      how                 HOW_DERIVED | HOW_PIN | HOW_FLOOR | HOW_NONE.  Only
+                          HOW_DERIVED means "a session for this run is visible";
+                          the floor's answer reads as no transcript here, which
+                          is what it is from the verdict's point of view
       quiet_s             seconds since the newest liveness signal, or None
       pushed              HEAD == origin/<branch>
       asks / limit_hit    the two "waiting on user" signals

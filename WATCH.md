@@ -53,7 +53,9 @@ see a branch in the environment and report it as `given`.
 below. `SPANWEAVE_PINNED` is empty by default — there is no pinned transcript.
 
 Each poll prints a one-line banner naming the transcript it is watching, HEAD,
-`origin/<branch>`, the liveness timestamp and its age, the last observed
+`origin/<branch>`, the liveness timestamp and its age — or
+`liveness: unknown (no transcript newer than base)` where there is no
+transcript to read one from (see **Which transcript is the builder's**) — the last observed
 `pendingBackgroundAgentCount`, the batches still open — the field is
 `open:`, and `open: (none)` means every listed batch has stopped — any
 currently suppressed trigger, and — if the arming PID set is empty — that `builder gone`
@@ -74,6 +76,14 @@ then held fixed for the life of that watch. Both used to be constants in
 minutes, so **they** arm, at their own start, and export both down; a
 `watch_run.sh` started directly arms for itself. Whoever arms first owns both
 values for the whole watch.
+
+Arming also says one line when **liveness is unknown for the base** it was armed
+on (see **Which transcript is the builder's**). That is a fact about a base, and
+the two looping front ends arm before anything parses their flags, so they pull
+`--base` out of their own argv and export it first — otherwise the note would be
+computed against a *previous* run's default base, and a note about the wrong base
+is worse than no note. `watch_run.sh` and `status_check.sh` parse `--base`
+themselves, so they always have it.
 
 **Why once and not per poll.** Re-reading either would disarm a trigger rather
 than keep it fresh:
@@ -114,6 +124,12 @@ question no longer costs the watch.
 | **stall** | no | once, then suppressed for a further 40 min without movement |
 | watcher error | yes, exit `2` | — |
 
+With **liveness unknown** — the base-time floor left no candidate transcript and
+no pin — `stall` keeps this policy exactly, and runs on the commit and
+`.git/index` times alone: liveness neither arms it nor holds it off. `waiting on
+user` is unreachable in that state, because there is no transcript to read a
+question or a limit notice out of.
+
 A suppressed `waiting on user` or `stall` is lifted the moment any watched
 signal moves, and the lift is itself reported as one line:
 
@@ -151,7 +167,13 @@ brackets every event:
 | `10` | **finished** (terminal), and also **finished (CI unverified)** — same end state, an unread CI |
 | `15` | **finished: CI red on `<sha>`** (terminal) |
 | `13` | **builder gone** (terminal) |
-| `2` | watcher error (no builder transcript found, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
+| `2` | watcher error (no transcript was ever a candidate, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
+
+A transcript directory whose every candidate the **base-time floor** refused is
+not exit `2`: the watch keeps polling with liveness unknown. Only "nothing in
+there was ever a candidate for this run" is the error. `status_check.sh` has
+nothing to poll, so it still exits `2` in both cases — but it says which of the
+two it is, and lists what was refused and why.
 
 `11` (waiting on user), `12` (stall) and `14` (tripwire) name the triggers in
 prose and in `state/`; they are **not** exit codes any more, because those
@@ -173,7 +195,9 @@ that directory whose most recent `"lastPrompt"`:
    **and**
 3. does not name a different run *without* also naming `N`, **and**
 4. is neither this session's own transcript (`CLAUDE_CODE_SESSION_ID`) nor a
-   known past watcher/aux one (`SPANWEAVE_SELF`).
+   known past watcher/aux one (`SPANWEAVE_SELF`), **and**
+5. whose **last write is not earlier than the base commit's author time** — the
+   floor, below. This one is not about the prompt at all.
 
 **Why 1 exists.** Aux sessions talk about the plan and name the run too, so
 once rule 2 stopped demanding the literal phrase they became candidates: a
@@ -210,12 +234,88 @@ excluded by `CLAUDE_CODE_SESSION_ID` instead; the static list now covers only
 watcher and aux sessions from earlier. `selftest.sh` asserts both halves,
 including that without the session id the watcher does derive onto itself.
 
+**Why 5 exists — run numbers are per-series.** On 2026-10-01 a run-3 watch of
+the `live-graphs` series derived onto
+`351ac45a-5ef8-4d8a-a988-c1f213eda35a.jsonl`, whose own mtime is 2026-09-11
+00:37 and whose `subagents/` mtime is 2026-09-10 17:09 — twenty days before the
+run it was watching, whose base (`ce9ff17`) was authored 2026-10-01 00:23:40. It
+reported that finished session's liveness and then `finished`. Two independent
+causes met, and rules 1–4 cannot catch either:
+
+- **Run numbers are per-series.** `351ac45a`'s `lastPrompt` is `Apply
+  ~/Downloads/run3-2026-09-11.md with one plan-only sub-agent (recreate
+  WORKPLAN.md from git show c79cbc5:WORKPLAN.md, restore its README row, single
+  commit plan: reopen for run 3 -- run-2 review…`. That is the *September audit
+  series'* run 3, and every predicate says yes: not aux in its first 80
+  characters, names `WORKPLAN.md`, names run 3 operatively, spared by rule 3
+  because it names run 3 itself. Nothing in the derivation knows about series or
+  about recency, and `run 3` alone cannot tell one series' third run from
+  another's.
+- **The stored `lastPrompt` is truncated at ~200 characters.** The real run-3
+  builder, `1d41a6d1-cc2d-4535-a1a6-445dc3875bd9.jsonl` (own mtime 2026-10-01
+  15:49, `subagents/` 2026-10-01 01:20), stored `In ~/git/spanweave on
+  live-graphs (tip 2cde61f), read WORKPLAN.md §0 in full. Apply
+  patches/decisions-live-2026-09-30.md exactly as its header says: one
+  plan-only sub-agent, one commit plan: run-2 rev…` — the only run number
+  inside the cut is **2**, so rule 2 fails on it and it is not a candidate. The
+  phrase that named run 3 lay beyond the cut.
+
+So the wrong transcript was the **only** candidate and won outright: the
+ordering below never got a chance to prefer the newer session. A date is a fact
+about *this* run where a run number is only a fact about *some* run, so the
+floor is where that gap closes.
+
+**What "last write" means, and why.** The **newer of** the transcript's own
+mtime and its `<stem>/subagents/` directory mtime. Of the available readings
+that is the conservative one — the one least likely to exclude a *live* builder:
+a builder's own file sits unflushed for minutes while a batch sub-agent runs,
+and the directory's mtime moves when that sub-agent's file is created, so "own
+mtime alone" would refuse a working builder and the newer of the two cannot. It
+is the directory's own mtime, not the recursive newest-file mtime *liveness*
+uses, so the two numbers that bound a candidate are exactly the two that order
+it. The floor is the base commit's **author** time, not its committer time: a
+rebase, an amend or a cherry-pick rewrites the committer time to *now*, which
+would drag the floor forward over work the run already contains. It is read with
+`git log -1 --format=%at <base>` from the base the watch already resolved (a
+given `--base` outranking the persisted baseline, `b308424`). A base the repo
+cannot resolve yields **no floor**: a watch does not invent a bound it could not
+read.
+
 Among candidates: the newest **`<stem>/subagents/` directory mtime** wins, then
 the transcript's own mtime, then the name. (That is the *derivation* tiebreak;
 *liveness* separately uses the newest mtime of any file anywhere under
-`subagents/`, which is the finer signal.) With no candidate the configured pin
-is used — an operator override, so it is not re-tested against the run number.
-With no candidate and no pin the script exits `2`.
+`subagents/`, which is the finer signal.)
+
+**That ordering is the implementation of "the newest write wins."** A
+`subagents/` directory is only written by a builder that is *orchestrating*, so
+it is the stronger of the two signals and is read first rather than averaged
+with the other. The two readings diverge in exactly one case: a candidate with a
+newer **own** mtime and **no** `subagents/` directory loses to one with a newer
+`subagents/` mtime and an older own mtime. The ordering's answer is the preferred
+one — the orchestrating session is the builder, and its own file goes quiet
+precisely *while* its sub-agent works, so "newest own mtime" would hand the watch
+to a session that typed one line. `selftest.sh` pins it ("a newer transcript
+still loses to a newer `subagents/` dir"). Both candidates have cleared the
+floor by then, so neither can be a previous series' session.
+
+With no candidate the configured pin is used — an operator override, so it is
+re-tested against neither the run number **nor** the floor.
+
+With no candidate and no pin there are two different answers, and they are not
+reported as one:
+
+| | means | watch |
+|---|---|---|
+| nothing was ever a candidate | no session in the directory is working this run | watcher error, exit `2`, as before |
+| the floor refused every candidate | the builder's session is not visible from here | **liveness unknown** — a degraded mode, not an error |
+
+In the second state the banner prints `liveness: unknown (no transcript newer
+than base)` in place of the timestamp and age, the evidence block names the
+refused files and by how much each missed, and the watch goes on polling. It
+never prints a borrowed age. Every rejection — floor or prompt — is listed with
+its own reason, so the near miss is visible rather than hidden; the two
+rejections above are distinguishable in that list, one by its timestamps and one
+by its truncation.
 
 **There is no default pin.** `SPANWEAVE_PINNED` is empty unless an operator
 sets it. It used to name run 2's builder transcript, which meant every run
@@ -272,8 +372,23 @@ sub-agent runs; the file that moves is the sub-agent's. Liveness is therefore th
 - the builder transcript's mtime, and
 - the newest mtime anywhere under `<transcript-stem>/subagents/`.
 
+With the floor leaving no candidate and no pin there is nothing to read either
+mtime from, and liveness is **unknown**: the banner says
+`liveness: unknown (no transcript newer than base)`, the evidence block prints
+the base's author time, the `.git/index` mtime and the last commit — the
+timestamps that *are* known — and no age is invented from an old file.
+
 The last `pendingBackgroundAgentCount` seen in a `system` entry in the last 60
 lines is read as a secondary signal (`1` means a batch sub-agent is outstanding).
+It is read from the **chosen** transcript's tail and from nothing else — never
+from a union over the directory. The count feeds `stall` (through "a batch is in
+progress") and the `underway (in flight)` verdict, so a count borrowed from
+another session would report another run's sub-agent as this run's activity and
+suppress a stall on evidence about a session the watch is not watching. The
+2026-10-01 drift was one derivation away from doing exactly that. The code was
+already correct here; it now says so, and `selftest.sh` keeps a decoy transcript
+claiming `7` in the fixture directory and pins that the watch reports the chosen
+transcript's `0`.
 
 ## Triggers
 
@@ -433,6 +548,24 @@ the builder marks a row `done` only *after* the batch lands, so a running batch
 shows as `todo`). Evidence: the three timestamps, `git status --short`,
 `pendingBackgroundAgentCount`.
 
+*With liveness unknown, liveness is **excluded** from this rule* — not read as
+quiet and not read as moving. The commit time and the `.git/index` mtime still
+count and still arm the stall on their own; liveness neither arms it nor
+suppresses it. Both halves matter: an ancient mtime read as "quiet" would arm a
+stall off a dead session's timestamp, which is the 2026-10-01 drift in miniature,
+and an mtime that never moves would hold the stall off forever. For the same
+reason a transcript moving anywhere in the directory cannot emit a `RESUMED` in
+that state — the watch is not watching one, so there is nothing for it to have
+moved; a new commit or a touched `.git/index` still lifts a suppression, because
+those were really observed. The stall's evidence block says which of the two
+rules it fired under, and `arming.sh` says it once up front:
+
+```
+arming: liveness is unknown for base ce9ff17 (authored 2026-10-01 00:23:40): every
+candidate transcript in … was last written before it, so the stall rule runs on the
+commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to override.
+```
+
 ## State
 
 `state/` (gitignored):
@@ -453,7 +586,7 @@ shows as `todo`). Evidence: the three timestamps, `git status --short`,
 
 ## Verified
 
-`./selftest.sh` — 202 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 232 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -488,6 +621,25 @@ Every CI case answers through a **stub `gh`** placed first on `PATH` for the
 whole script, which prints canned JSON and never opens a socket; its default
 is the unavailable branch, so a case that forgets to say what CI said gets the
 unverified answer rather than a call to the real `gh`.
+
+It covers the **base-time floor** against the 2026-10-01 shapes: the September
+run-3 prompt is shown to be a perfectly good run-3 builder prompt and the
+transcript is still refused, with the rejection naming both timestamps; the same
+transcript is **accepted** once the base's author time is moved behind it, so it
+is the floor and not the prompt that refuses it; a candidate whose own mtime
+predates the base but whose `subagents/` mtime does not is **kept**, and refused
+once that mtime is old too; the real builder's truncated `lastPrompt` refuses it
+for its own reason, with the floor satisfied, so the two rejections are
+distinguishable in one list; and a pin is honoured without being floor-tested.
+The degraded mode has its own fixture: a base 90 minutes old against a
+transcript from 2026-09-11, where the banner says `liveness: unknown (no
+transcript newer than base)` and no age at all, `arming.sh` says it once, the
+stall fires on the commit and `.git/index` times alone and says that liveness is
+excluded rather than quiet, a transcript moving elsewhere in the directory emits
+no `RESUMED`, and the stall is suppressed and repeated on exactly the normal
+schedule. One more fixture keeps `pendingBackgroundAgentCount` honest: a decoy
+transcript claiming `7`, newer than the builder but never a candidate, while the
+banner and the status report both read the chosen transcript's `0`.
 
 It also covers the `main_sha` seeding: a stale `main_sha` from a previous
 series is seeded rather than reported, a genuine mid-watch move still fires on
@@ -537,6 +689,19 @@ and each trigger's evidence block rendering correctly.
 - 2026-09-10 04:25: the watch died `exit 2` when G4 staged the deletion of
   `WORKPLAN.md`. Fixed above — the plan now has three sources and an absent
   plan is a closed series, not an error.
+- 2026-10-01: a run-3 watch of the `live-graphs` series derived onto
+  `351ac45a-…jsonl` — own mtime 2026-09-11 00:37, `subagents/` 2026-09-10 17:09,
+  twenty days before the base `ce9ff17` it was armed on (authored 2026-10-01
+  00:23:40) — and reported that finished session's liveness and then `finished`.
+  Its `lastPrompt` (`Apply ~/Downloads/run3-2026-09-11.md … reopen for run 3 --
+  run-2 review…`) is a correct run-3 builder prompt: it is the *September audit
+  series'* run 3, and **run numbers are per-series**. The actual builder,
+  `1d41a6d1-…jsonl`, was not even a candidate, because its stored `lastPrompt` is
+  cut at ~200 characters (`… one commit plan: run-2 rev…`) and the only run
+  number inside the cut is 2. One candidate, so it won with no contest. Fixed by
+  the **base-time floor** above, and by reporting both near misses instead of
+  one of them; `pendingBackgroundAgentCount` was audited at the same time and was
+  already read from the chosen transcript alone.
 - 2026-09-30: the three session-shaped constants were retired. A run-2 status
   check against the `live-graphs` series compared everything against
   `origin/audit-fixes`: `git fetch` failed with *couldn't find remote ref*,

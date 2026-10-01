@@ -68,13 +68,20 @@ while :; do
 import json, os, re, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (STALL_QUIET_S, WAIT_QUIET_S, age, asks_question, ci_conclusion,
+from watch_lib import (HOW_FLOOR, STALL_QUIET_S, WAIT_QUIET_S, age, asks_question,
+                       base_author_time, ci_conclusion,
                        claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, render, resume_note_tail,
                        stamp, subagents_dir, substantive, tail_entries,
                        workplan_statuses)
+
+# Printed in place of the liveness timestamp and age when the base-time floor
+# left no candidate and no pin.  A watch that cannot see a transcript written
+# since the base has nothing to say about liveness, and saying "0.0 min ago"
+# off a twenty-day-old file is the drift this mode exists to end.
+LIVENESS_UNKNOWN = "liveness: unknown (no transcript newer than base)"
 
 CFG    = config()
 REPO   = CFG["repo"]
@@ -159,30 +166,47 @@ def main():
     def event(kind, text):
         events.append((kind, text))
 
+    # Stat the index BEFORE running any git command - and the derivation below
+    # now runs one, because the base-time floor reads the base commit's author
+    # time.  A plain `git status` can rewrite .git/index while refreshing stat
+    # info, which would make the watcher's own read look like builder activity.
+    # (`--no-optional-locks` below is the second half of that guard.)
+    idx_m = mtime(os.path.join(REPO, ".git", "index"))
+
     # -- transcript ----------------------------------------------------------
-    tname, tprompt, cands, how, _rejected = derive_transcript(CFG)
-    if tname is None:
+    tname, tprompt, cands, how, rejected = derive_transcript(CFG)
+    # Two different "no transcript" answers.  HOW_FLOOR means candidates existed
+    # and every one of them was last written before the base commit, so the
+    # builder's session is not visible from here: liveness is UNKNOWN, which is
+    # a degraded-but-honest mode, not an error.  HOW_NONE means nothing in the
+    # directory was ever a candidate, which is the watcher error it always was.
+    unknown_liveness = (tname is None and how == HOW_FLOOR)
+    base_at = base_author_time(REPO, BASE) if unknown_liveness else None
+    if tname is None and not unknown_liveness:
         event("watcher error",
               "WATCHER ERROR: no builder transcript found for run %d in %s" % (RUN, TDIR))
         return ERROR, events, st
-    tpath = os.path.join(TDIR, tname)
-    sub   = subagents_dir(TDIR, tname)
-    t_m   = mtime(tpath)
-    s_m   = newest_under(sub) if os.path.isdir(sub) else None
-    live  = max([x for x in (t_m, s_m) if x is not None], default=None)
-    entries = tail_entries(tpath, 60)
-    pending = pending_agents(entries)
-    # Only meaningful against an operator-given pin.  There is no default pin
-    # any more, and reporting "FOLLOWED" against an empty one would put a drift
-    # notice on every poll of every run.
-    followed = bool(PINNED) and tname != PINNED
+    if unknown_liveness:
+        tpath = sub = None
+        t_m = s_m = live = None
+        entries, pending, followed = [], None, False
+    else:
+        tpath = os.path.join(TDIR, tname)
+        sub   = subagents_dir(TDIR, tname)
+        t_m   = mtime(tpath)
+        s_m   = newest_under(sub) if os.path.isdir(sub) else None
+        live  = max([x for x in (t_m, s_m) if x is not None], default=None)
+        # `pendingBackgroundAgentCount` is read from the chosen transcript's
+        # tail and from nothing else - never from a union over the directory.
+        # See `pending_agents`.
+        entries = tail_entries(tpath, 60)
+        pending = pending_agents(entries)
+        # Only meaningful against an operator-given pin.  There is no default
+        # pin any more, and reporting "FOLLOWED" against an empty one would put
+        # a drift notice on every poll of every run.
+        followed = bool(PINNED) and tname != PINNED
 
     # -- repo ----------------------------------------------------------------
-    # Stat the index BEFORE running any git command: a plain `git status` can
-    # rewrite .git/index while refreshing stat info, which would make the
-    # watcher's own read look like builder activity.  (`--no-optional-locks`
-    # below is the second half of that guard.)
-    idx_m = mtime(os.path.join(REPO, ".git", "index"))
     # With no branch there is no ref to fetch and none to compare against, so
     # `origin` stays empty and `finished` stays unreachable - reported at the
     # end of the poll rather than silently.
@@ -226,11 +250,14 @@ def main():
 
     # -- per-poll banner -----------------------------------------------------
     suppressed = [k for k in ("waiting", "stall") if st.get(k)]
-    banner = ("poll %s | run %d | watching %s%s | HEAD %s | origin %s | liveness %s (%s ago)"
+    banner = ("poll %s | run %d | watching %s%s | HEAD %s | origin %s | %s"
               " | pendingBackgroundAgentCount=%s | open: %s%s"
-              % (stamp(now), RUN, tname,
+              % (stamp(now), RUN,
+                 tname or "(no transcript newer than base)",
                  "  <-- FOLLOWED (pin was %s)" % PINNED if followed else "",
-                 headshort, origin[:7] if origin else "?", stamp(live), age(live, now),
+                 headshort, origin[:7] if origin else "?",
+                 LIVENESS_UNKNOWN if unknown_liveness
+                 else "liveness %s (%s ago)" % (stamp(live), age(live, now)),
                  pending, ",".join(active) if active else "(none)",
                  ("%s%s%s" % (" | plan from %s" % plan_src if plan_src != "worktree" else "",
                               " | suppressed: %s" % ",".join(suppressed) if suppressed else "",
@@ -263,6 +290,22 @@ def main():
         return "\n".join(entry_line(e) for e in entries[-n:])
 
     def liveness_block():
+        if unknown_liveness:
+            # No fake age, and no borrowed one.  The two timestamps that ARE
+            # known are printed, the near misses with them, so the reader sees
+            # how far short the directory fell rather than a number.
+            L = ["  %s" % LIVENESS_UNKNOWN,
+                 "  base commit author ts : %s (%s ago)" % (stamp(base_at),
+                                                            age(base_at, now)),
+                 "  .git/index mtime      : %s (%s ago)" % (stamp(idx_m),
+                                                            age(idx_m, now)),
+                 "  last local commit     : %s (%s ago)" % (stamp(last_commit_epoch),
+                                                            age(last_commit_epoch, now))]
+            for name, why in rejected:
+                L.append("  refused: %s  %s" % (name, why))
+            L.append("  Liveness is excluded from the stall rule while it is unknown:")
+            L.append("  the commit time and the .git/index mtime still arm it.")
+            return "\n".join(L)
         return ("  transcript mtime      : %s (%s ago)\n"
                 "  subagents newest mtime: %s (%s ago)\n"
                 "  liveness (newer of)   : %s (%s ago)\n"
@@ -274,7 +317,8 @@ def main():
 
     header = ("watching : %s (%s)\nlastPrompt: %s\nrepo     : %s (branch %s)\n"
               "HEAD     : %s\norigin/%s: %s\nbase     : %s (%s)"
-              % (tpath, how, (tprompt or "")[:200], REPO, curbranch,
+              % (tpath or "(none - no transcript newer than base)", how,
+                 (tprompt or "")[:200], REPO, curbranch,
                  head, BRANCH, origin, BASE, basefull))
 
     def lines_to_text(lines):
@@ -284,6 +328,12 @@ def main():
     # A suppressed `waiting on user` or `stall` is lifted the moment any watched
     # signal moves again, and the lift is itself reported - one line, so the
     # human sees the pause end without re-reading an evidence block.
+    #
+    # While liveness is unknown it is not one of those signals: `obs["live"]` is
+    # None, and `movement()` reports a liveness move only when it has a reading
+    # on BOTH sides, so no transcript moving anywhere in the directory can emit
+    # a RESUMED for a watch that is not watching one.  A new commit or a touched
+    # `.git/index` still lifts a suppression, because those were really observed.
     for key in ("waiting", "stall"):
         rec = st.get(key)
         if not rec:
@@ -533,7 +583,14 @@ def main():
     batch_running = bool(active) or bool(pending)
     commit_quiet = (last_commit_epoch is None) or (now - last_commit_epoch >= STALL_QUIET_S)
     index_quiet  = (idx_m is None) or (now - idx_m >= STALL_QUIET_S)
-    if batch_running and commit_quiet and index_quiet and quiet >= STALL_QUIET_S:
+    # With liveness unknown, liveness is EXCLUDED from the rule rather than
+    # read either way: it must not arm the stall (an ancient mtime would make
+    # every poll look quiet, which is how a dead session's timestamp got
+    # reported as a live run's in the first place) and it must not suppress it
+    # (an mtime that never moves would hold the stall off forever).  The commit
+    # time and the `.git/index` mtime still count, and still arm it alone.
+    liveness_quiet = True if unknown_liveness else (quiet >= STALL_QUIET_S)
+    if batch_running and commit_quiet and index_quiet and liveness_quiet:
         prev = st.get("stall")
         repeat = bool(prev)
         due = (not prev) or (now - (prev.get("fired_at") or 0) >= STALL_QUIET_S)
@@ -544,8 +601,14 @@ def main():
                         % age(prev.get("fired_at"), now) if repeat else ""))
             L.append(header)
             L.append("")
-            L.append("No new commit, no .git/index change, no liveness movement for >= 40 min")
-            L.append("while a batch is in progress.")
+            if unknown_liveness:
+                L.append("No new commit and no .git/index change for >= 40 min while a batch")
+                L.append("is in progress.  Liveness is unknown for this base (no transcript")
+                L.append("newer than it), so it is excluded from the rule - it neither armed")
+                L.append("this stall nor could have held it off.")
+            else:
+                L.append("No new commit, no .git/index change, no liveness movement for >= 40 min")
+                L.append("while a batch is in progress.")
             L.append("")
             L.append(liveness_block())
             L.append("")
@@ -558,7 +621,9 @@ def main():
             L.append("Last 10 transcript entries:")
             L.append(transcript_block(10))
             L.append("")
-            L.append("Suppressed for a further 40 min, or until liveness moves.")
+            L.append("Suppressed for a further 40 min, or until a watched signal moves."
+                     if unknown_liveness else
+                     "Suppressed for a further 40 min, or until liveness moves.")
             event("stall", lines_to_text(L))
             st["stall"] = dict(obs, fired_at=now)
 

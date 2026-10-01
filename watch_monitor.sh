@@ -34,6 +34,9 @@ STATE="${SPANWEAVE_STATE_DIR:-$HERE/state}"
 mkdir -p "$STATE"
 
 . "$HERE/arming.sh"
+# The base out of argv, so arming's liveness note is about the base this watch
+# is actually armed on: arming runs before `watch_run.sh` ever sees these flags.
+spanweave_export_base "$@"
 spanweave_arm
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-6}"    # invocations (~9 min each) between heartbeats
 

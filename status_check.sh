@@ -47,7 +47,7 @@ python3 - <<'PY'
 import os, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (ARM_CMD_PREFIX, age, asks_question, claude_processes,
+from watch_lib import (ARM_CMD_PREFIX, HOW_FLOOR, age, asks_question, claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, resume_note_tail, stamp,
@@ -185,12 +185,26 @@ head("builder transcript (derivation rule: run %d)" % RUN)
 tname, tprompt, cands, how, rejected = derive_transcript(CFG)
 if tname is None:
     print("WATCHER ERROR: no builder transcript found for run %d in %s" % (RUN, TDIR))
+    if how == HOW_FLOOR:
+        # Which of the two "no transcript" answers this is, said out loud: every
+        # candidate was last written before the base commit, so liveness is
+        # unknown for this base rather than merely unobserved.  `watch_run.sh`
+        # degrades and keeps polling on this; a one-shot report has nothing to
+        # poll, so it still exits 2 - but not without naming the reason.
+        print("  Every candidate was refused by the base-time floor - no transcript")
+        print("  in this directory was written after base %s. Liveness is unknown" % BASE)
+        print("  for this base. Pass SPANWEAVE_PINNED=<uuid>.jsonl to override.")
+        for name, why in rejected:
+            print("  refused: %s  %s" % (name, why))
     sys.exit(2)
 tpath = os.path.join(TDIR, tname)
 sub   = subagents_dir(TDIR, tname)
 t_m   = mtime(tpath)
 s_m   = newest_under(sub) if os.path.isdir(sub) else None
 live  = max([x for x in (t_m, s_m) if x is not None], default=None)
+# The chosen transcript's tail, and only that one: `pendingBackgroundAgentCount`
+# below is read from these entries, never from a union over the directory, so a
+# count printed here is always this builder's.  See `pending_agents`.
 entries = tail_entries(tpath, 60)
 pending = pending_agents(entries)
 
