@@ -2053,6 +2053,178 @@ printf '%s\n' "$out" | grep -q "not a close" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "the series close is the one WORKPLAN.md commit that cannot say 'plan:'"
+# ---------------------------------------------------------------------------
+# The convention is that a commit touching WORKPLAN.md reports on a batch, so
+# its subject starts `plan:`, and the tripwire says so.  The close batch is the
+# single commit that cannot obey it: it *deletes* the plan, and there is no row
+# left to report on.  Run 5's close landed as `docs: the live-graphs series
+# closes, and WORKPLAN.md goes with it` and tripped a rule it was right to
+# break.
+#
+# The exemption is deliberately narrow, and the cases below pin both halves.  A
+# delete is read as a close only when the plan was present at the BASE commit -
+# so there was a series here to close - and only ONCE per series, because a
+# series closes once.  Without the second half the rule is a blanket hole: any
+# commit could drop the file and walk past it by doing so.
+RXD="$TMP/repoX"; mkdir -p "$RXD"
+git -C "$RXD" init -q -b live-graphs
+git -C "$RXD" config user.email t@example.invalid
+git -C "$RXD" config user.name Selftest
+cat > "$RXD/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L23 | thing | todo | 20 |
+| L24 | thing | todo | 15 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$RXD" add -A && git -C "$RXD" commit -qm "base"
+BASEX="$(git -C "$RXD" rev-parse HEAD)"
+git init -q --bare "$TMP/remoteX.git"
+git -C "$RXD" remote add origin "$TMP/remoteX.git"
+git -C "$RXD" push -q origin live-graphs
+
+TDX="$TMP/tdirX"; mkdir -p "$TDX"; STX="$TMP/stateX"; mkdir -p "$STX"
+# `Resume WORKPLAN.md` is a builder prompt for ANY run (RESUME_RE), which is
+# what lets the last case below poll a second series without the fixture's
+# transcript suddenly naming the wrong run.
+printf '{"type":"last-prompt","lastPrompt":"Resume WORKPLAN.md"}\n' > "$TDX/78787878.jsonl"
+
+runx() {  # runx [run] -> "<exit>|<event kinds>"; default run 5
+  local out rc
+  out="$(SPANWEAVE_STATE_DIR="$STX" SPANWEAVE_REPO="$RXD" SPANWEAVE_TDIR="$TDX" \
+         SPANWEAVE_PINNED="78787878.jsonl" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+         SPANWEAVE_BASE="$BASEX" SPANWEAVE_BRANCH=live-graphs SPANWEAVE_PIDS="" \
+         SPANWEAVE_BATCHES="L23 L24" SPANWEAVE_MEMO="" \
+         "$OPS_DIR/watch_run.sh" --once --run "${1:-5}" 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" > "$TMP/last_runX.txt"
+  printf '%s|%s' "$rc" \
+    "$(printf '%s\n' "$out" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)"
+}
+
+# (a) The rule itself, unchanged: a commit that MODIFIES the plan under a
+#     non-`plan:` subject still trips.  The exemption is about deleting, and a
+#     fixture that could not tell the two apart would prove nothing below.
+printf '\n- touched.\n' >> "$RXD/WORKPLAN.md"
+git -C "$RXD" add -A
+git -C "$RXD" commit -qm "docs: tidy the plan's wording"
+check "modifying WORKPLAN.md under a non-'plan:' subject still trips" \
+      "$(runx)" "0|tripwire"
+grep -q "subject does not start with 'plan:'" "$TMP/last_runX.txt" \
+  && ok "the block names the 'plan:' subject rule" \
+  || bad "the block does not name the 'plan:' subject rule"
+
+# (b) The control in the other direction: a real `plan:` commit never tripped
+#     and still does not.
+printf '\n- L23 done.\n' >> "$RXD/WORKPLAN.md"
+git -C "$RXD" add -A
+git -C "$RXD" commit -qm "plan: L23 done"
+check "a 'plan:' commit touching WORKPLAN.md does not trip" "$(runx)" "0|"
+
+# (c) The close: deletes the plan, subject says `docs:`, plan was at base.
+git -C "$RXD" rm -q WORKPLAN.md
+git -C "$RXD" commit -qm "docs: the live-graphs series closes, and WORKPLAN.md goes with it"
+CLOSEX="$(git -C "$RXD" rev-parse HEAD)"
+check "the close deletes the plan under a 'docs:' subject and does not trip" \
+      "$(runx)" "0|"
+grep -q "read as the series close" "$TMP/last_runX.txt" \
+  && ok "the exemption prints, so a reader can tell it was granted" \
+  || bad "the exemption is silent, so a reader cannot tell it was granted"
+grep -q "${CLOSEX:0:7}" "$TMP/last_runX.txt" \
+  && ok "the note names the exempted commit" \
+  || bad "the note does not name the exempted commit"
+python3 - "$STX/watch_state.json" "$CLOSEX" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+got = st.get("close_exempt")
+if got == sys.argv[2]:
+    print("  PASS  watch_state.json records which commit the exemption was spent on")
+else:
+    print("  FAIL  watch_state.json close_exempt is %r, want %r" % (got, sys.argv[2]))
+    sys.exit(1)
+PY
+[ $? -eq 0 ] || fail=1
+
+# (d) Once per series.  Recreating the plan under a `plan:` subject is fine;
+#     deleting it a SECOND time is not a close, and the exemption is spent.
+cat > "$RXD/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L23 | thing | done (`aaaaaaa`) | 20 |
+MD
+git -C "$RXD" add -A && git -C "$RXD" commit -qm "plan: reopen for one more batch"
+git -C "$RXD" rm -q WORKPLAN.md
+git -C "$RXD" commit -qm "chore: drop the plan again"
+check "a second WORKPLAN.md delete in the same series does trip" \
+      "$(runx)" "0|tripwire"
+grep -q "subject does not start with 'plan:'" "$TMP/last_runX.txt" \
+  && ok "the second delete is reported under the 'plan:' subject rule" \
+  || bad "the second delete is not reported under the 'plan:' subject rule"
+
+# (e) A new series clears it, like `main_sha`.  The series identity is the run,
+#     the branch and the base, so polling run 6 is a new series - and its own
+#     close is exempt again rather than inheriting run 5's spent exemption.
+cat > "$RXD/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L23 | thing | todo | 20 |
+MD
+git -C "$RXD" add -A && git -C "$RXD" commit -qm "plan: open the next series"
+git -C "$RXD" rm -q WORKPLAN.md
+git -C "$RXD" commit -qm "docs: the next series closes too"
+check "a new series gets its own exemption, not the last one's leftovers" \
+      "$(runx 6)" "0|"
+grep -q "read as the series close" "$TMP/last_runX.txt" \
+  && ok "the new series' close is exempt" \
+  || bad "the new series' close is not exempt"
+
+# (f) The other half of the narrowing: no plan at the base commit means there
+#     was no series here to close, so a delete is just a delete.  This is the
+#     `plan_at_rev` distinction that already keeps "a plan not yet written"
+#     from being read as a finished run - the exemption leans on the same fact.
+RYD="$TMP/repoY"; mkdir -p "$RYD"
+git -C "$RYD" init -q -b live-graphs
+git -C "$RYD" config user.email t@example.invalid
+git -C "$RYD" config user.name Selftest
+echo seed > "$RYD/README.md"
+git -C "$RYD" add -A && git -C "$RYD" commit -qm "base without a plan"
+BASEY="$(git -C "$RYD" rev-parse HEAD)"
+git init -q --bare "$TMP/remoteY.git"
+git -C "$RYD" remote add origin "$TMP/remoteY.git"
+git -C "$RYD" push -q origin live-graphs
+printf 'x\n' > "$RYD/WORKPLAN.md"
+git -C "$RYD" add -A && git -C "$RYD" commit -qm "plan: recreate the plan"
+git -C "$RYD" rm -q WORKPLAN.md
+git -C "$RYD" commit -qm "docs: and the series closes"
+TDY="$TMP/tdirY"; mkdir -p "$TDY"; STY="$TMP/stateY"; mkdir -p "$STY"
+printf '{"type":"last-prompt","lastPrompt":"Resume WORKPLAN.md"}\n' > "$TDY/79797979.jsonl"
+outy="$(SPANWEAVE_STATE_DIR="$STY" SPANWEAVE_REPO="$RYD" SPANWEAVE_TDIR="$TDY" \
+        SPANWEAVE_PINNED="79797979.jsonl" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+        SPANWEAVE_BASE="$BASEY" SPANWEAVE_BRANCH=live-graphs SPANWEAVE_PIDS="" \
+        SPANWEAVE_BATCHES="L23 L24" SPANWEAVE_MEMO="" \
+        "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+rcy=$?
+printf '%s\n' "$outy" > "$TMP/last_runY.txt"
+check "with no plan at base, a delete is not a close and does trip" \
+      "$rcy|$(printf '%s\n' "$outy" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)" \
+      "0|tripwire"
+grep -q "read as the series close" "$TMP/last_runY.txt" \
+  && bad "the exemption was granted with no plan at base" \
+  || ok "the exemption is withheld with no plan at base"
+
+echo
 echo "verdict - one of exactly six values, from evidence alone"
 # ---------------------------------------------------------------------------
 python3 - <<'PY'

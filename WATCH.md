@@ -499,6 +499,7 @@ longer needs the state file deleted. With no `--base`, the range is
 `last_seen_head..HEAD` as before:
 
 - subject does not start with `plan:` but the commit touches `WORKPLAN.md`
+  — **except the series close**, which *deletes* the plan (see below)
 - touches `spanweave/` while the body names batch **F1** (F1 is memo-only; it
   halts as `awaiting decision` if its design needs a model change)
 - touches `tests/serialized_shape.json` and the body does not mention
@@ -510,6 +511,32 @@ longer needs the state file deleted. With no `--base`, the range is
 
 Evidence: `git show --stat` plus subject and body for each newly reported
 commit, `git status --short`, `git stash list`, current branch, `main` sha.
+
+**The series close is exempt from the `plan:` subject rule.** The convention
+behind that rule is that a commit touching `WORKPLAN.md` reports on a batch, so
+its subject names one. The close batch is the one commit that cannot obey it:
+it **deletes** the plan, and there is no row left to report on. Run 5's close
+landed as `docs: the live-graphs series closes, and WORKPLAN.md goes with it`
+and tripped a rule it was right to break.
+
+So a commit that deletes `WORKPLAN.md` is read as the close — but only on two
+facts, because a blanket exemption would mean any commit could drop the file
+and walk past the rule by doing so:
+
+- **the plan was present at the base commit**, so there was a series here to
+  close. This is `plan_at_rev`'s distinction, the same one that keeps "a plan
+  not yet written" from being read as a finished run: a rev that will not
+  resolve answers `None`, and *we could not look* is not evidence that a
+  series closed.
+- **no close has been exempted in this series yet.** A series closes once. The
+  exemption is spent on one sha, recorded in `watch_state.json` as
+  `close_exempt`, and a *second* `WORKPLAN.md` delete in the same series trips
+  normally. A new series clears it, exactly as it clears `main_sha`.
+
+A granted exemption **prints** (`note: <sha> deletes WORKPLAN.md and the plan
+was present at base …`), because a silent exemption is indistinguishable from
+a tripwire that was never armed. Modifying the plan under a non-`plan:` subject
+still trips: the exemption is about deleting, not about touching.
 
 **`local main moved` is scoped to a series.** It catches the builder landing
 work on `main` *while a watch is running*. But `watch_state.json` outlives a

@@ -420,6 +420,40 @@ def main():
     new_commits.reverse()
     fresh = [s for s in new_commits if s not in reported]
 
+    # The series-close exemption.  The plan convention is that a commit
+    # touching WORKPLAN.md reports on a batch, so its subject starts `plan:`.
+    # The close batch is the one commit that cannot obey it: it *deletes* the
+    # plan, and there is no row left to report on - run 5's close landed as
+    # `docs: the live-graphs series closes, and WORKPLAN.md goes with it`.  So
+    # a delete is exempt, but only on the two facts that make it a close
+    # rather than a stray `git rm`:
+    #
+    #   * the plan was present at the base commit, so there was a series here
+    #     to close.  `base_had_plan is True` and not merely truthy: a rev that
+    #     would not resolve gives None, and "we could not look" is not
+    #     evidence that a series closed (`plan_at_rev`).
+    #   * no close has been exempted in this series yet.  A series closes
+    #     once; without this the exemption is a blanket hole, because any
+    #     commit could drop the file and walk past the rule by doing so.  The
+    #     second deleting commit trips, which is the same shape as the
+    #     stale-constant guards above: the exemption is a fact about one
+    #     commit, not a mode the watch enters.
+    #
+    # It is keyed on the series identity and persisted, so it survives polls;
+    # a new series clears it, like `main_sha`.  And it prints, because a
+    # silent exemption is indistinguishable from a tripwire that is not armed.
+    close_exempt = None if new_series else st.get("close_exempt")
+
+    def deletes_plan(sha):
+        rc_ns, ns, _ = git("show", "--name-status", "--format=", sha)
+        if rc_ns != 0:
+            return False
+        for line in ns.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0].startswith("D") and parts[1] == "WORKPLAN.md":
+                return True
+        return False
+
     hits = []
     for sha in fresh:
         _, subj, _ = git("log", "-1", "--format=%s", sha)
@@ -435,7 +469,15 @@ def main():
         # guards a halt point, so its false positives are the expensive kind.
         declared = declared_batches(subj, body)
         if any(f == "WORKPLAN.md" for f in fl) and not subj.startswith("plan:"):
-            hits.append((sha, "touches WORKPLAN.md but subject does not start with 'plan:'"))
+            if close_exempt is None and base_had_plan is True and deletes_plan(sha):
+                close_exempt = sha
+                print("  note: %s deletes WORKPLAN.md and the plan was present at base"
+                      " (%s) - read as the series close and exempt from the 'plan:'"
+                      " subject rule, once for this series; a later WORKPLAN.md"
+                      " delete still trips" % (sha[:7], (basefull or BASE or "?")[:7]),
+                      flush=True)
+            else:
+                hits.append((sha, "touches WORKPLAN.md but subject does not start with 'plan:'"))
         memo_declared = [b for b in declared if b in MEMO]
         if any(f.startswith("spanweave/") for f in fl) and memo_declared:
             hits.append((sha, "touches spanweave/ while declaring memo-only batch(es) %s"
@@ -493,6 +535,7 @@ def main():
     reported.update(fresh)
     st["reported_commits"] = sorted(reported)[-500:]
     st["reported_conditions"] = conditions
+    st["close_exempt"] = close_exempt
     st["last_seen_head"] = head or last_seen
     st["main_sha"] = mainsha
     st["stash_count"] = stash_count
