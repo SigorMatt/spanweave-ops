@@ -500,14 +500,16 @@ out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
 rc=$?
 check "a committed WORKPLAN.md deletion does not raise a watcher error" \
       "$(printf '%s' "$rc" | sed 's/^2$/WATCHER ERROR/')" "0"
-printf '%s\n' "$out" | grep -q "plan from absent" \
-  && ok "the banner reports the plan as absent" \
-  || bad "the banner does not report the plan as absent"
+printf '%s\n' "$out" | grep -q "plan absent (series closed)" \
+  && ok "the banner reports the plan as absent, and as a close" \
+  || bad "the banner does not report the plan as absent and closed"
 printf '%s\n' "$out" | grep -q "open: (none)" \
   && ok "a closed plan leaves no batch open" \
   || bad "a closed plan still shows an open batch"
 
-# (3) with the plan closed and the branch pushed, `finished` is reachable.
+# (3) with the plan closed and the branch pushed, `finished` is reachable -
+# and it is the qualified form, because the reason there are no rows under it
+# is that the last batch deleted them.
 git -C "$R2" push -q origin audit-fixes
 gh_says "$R2" completed '"success"'
 out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
@@ -515,10 +517,60 @@ out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
        SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
        SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
        "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
-check "a closed, pushed plan still reaches finished" "$?" "10"
+check "a closed, pushed, green plan still reaches finished (exit 10)" "$?" "10"
+printf '%s\n' "$out" | grep -q "^>>> EVENT finished (series closed)\$" \
+  && ok "the trigger is 'finished (series closed)'" \
+  || bad "the trigger does not read 'finished (series closed)'"
 printf '%s\n' "$out" | grep -q "the series is closed" \
   && ok "the finished block says the series is closed" \
   || bad "the finished block does not say the series is closed"
+printf '%s\n' "$out" | grep -q "present at base $BASE2" \
+  && ok "the finished block names the base the plan was present at" \
+  || bad "the finished block does not say the plan was present at base"
+
+# (3b) ... and it is still gated on CI, exactly as a plan with rows is: a
+# closed series has no rows left to carry 0.1 step 8's second half, so the
+# only evidence for it is what CI said about the tip.
+gh_says "$R2" in_progress 'null'
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+check "a closed, pushed series with CI pending is not finished" "$?" "0"
+printf '%s\n' "$out" | grep -q "'finished (series closed)' cannot fire this poll" \
+  && ok "the pending poll says the closed-series trigger could not fire" \
+  || bad "the pending poll does not name the trigger it withheld"
+printf '%s\n' "$out" | grep -q "the series close landed" \
+  && ok "the pending note says what landed, not 'every batch stopped'" \
+  || bad "the pending note still claims every batch stopped"
+
+# (3c) `gh` unreadable: the run is closed and pushed, so the watch stops, but
+# it says the CI half is unchecked rather than printing a bare close.
+gh_unavailable
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+check "a closed series with gh unreadable is terminal (exit 10)" "$?" "10"
+printf '%s\n' "$out" | grep -q "^>>> EVENT finished (series closed, CI unverified)\$" \
+  && ok "the unverified close says so in the trigger line" \
+  || bad "the unverified close does not name itself"
+
+# (3d) CI red on the closed tip keeps its own name and its own exit code: the
+# push landed, and the run did not end green.
+gh_says "$R2" completed '"failure"'
+out="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
+       SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="A5 B3" \
+       "$OPS_DIR/watch_run.sh" --once --run 2 2>&1)"
+check "a closed series whose CI is red is 'CI red', not a close (exit 15)" "$?" "15"
+printf '%s\n' "$out" | grep -q "^>>> EVENT finished: CI red on " \
+  && ok "the closed-series CI-red trigger keeps the CI-red name" \
+  || bad "the closed-series CI-red trigger lost its name"
+gh_says "$R2" completed '"success"'
 
 # (4) a present-but-unreadable plan is still a watcher error.
 git -C "$R2" revert --no-edit HEAD >/dev/null 2>&1
@@ -1605,6 +1657,171 @@ grep -q "no PID set: 'builder gone' disarmed" "$TMP/last_run6.txt" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "a run whose last batch deletes the plan ends with no rows to read"
+# ---------------------------------------------------------------------------
+# G4's last act is `remove WORKPLAN.md`, so the run that closes the series ends
+# with the parser looking at a file that is not there.  Two different states
+# look exactly like that to a reader of the worktree:
+#
+#   the close          - a plan was there at base, and this run deleted it
+#   a plan not yet written - run 3's builder was started with "recreate
+#                        WORKPLAN.md from git show c79cbc5:WORKPLAN.md", so it
+#                        had no plan at base and none at HEAD until its plan
+#                        commit landed
+#
+# The old rule - "gone and pushed is finished" - called the second one a
+# finished run.  `plan_at_rev` is what separates them, and the close is
+# finished on the same terms as any other run: pushed AND green.
+RC="$TMP/repoC"; mkdir -p "$RC"
+git -C "$RC" init -q -b live-graphs
+git -C "$RC" config user.email t@example.invalid
+git -C "$RC" config user.name Selftest
+cat > "$RC/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L23 | thing | done (`aaaaaaa`) | 20 |
+| L24 | thing | done (`bbbbbbb`) | 15 |
+
+## 4. Resume note
+
+- L24 done.
+
+---
+MD
+echo x > "$RC/keep.txt"
+git -C "$RC" add -A
+GIT_COMMITTER_DATE="$(date -d '-90 min' -R)" GIT_AUTHOR_DATE="$(date -d '-90 min' -R)" \
+  git -C "$RC" commit -qm "base"
+BASEC="$(git -C "$RC" rev-parse HEAD)"
+git init -q --bare "$TMP/remoteC.git"
+git -C "$RC" remote add origin "$TMP/remoteC.git"
+git -C "$RC" push -q origin live-graphs
+
+TDC="$TMP/tdirC"; mkdir -p "$TDC"
+STC="$TMP/stateC"; mkdir -p "$STC"
+{
+  printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 5"}\n'
+  printf '{"type":"assistant","timestamp":"2026-10-02T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Closing the series."}]}}\n'
+} > "$TDC/cccccccc.jsonl"
+
+scC() {  # scC -> the status report for run 5 over this fixture
+  SPANWEAVE_REPO="$RC" SPANWEAVE_TDIR="$TDC" \
+  SPANWEAVE_PINNED="cccccccc.jsonl" SPANWEAVE_SELF="none.jsonl" \
+  SPANWEAVE_BASE="$BASEC" SPANWEAVE_BRANCH=live-graphs SPANWEAVE_PIDS="" \
+  "$OPS_DIR/status_check.sh" --run 5 --batches "L23 L24" 2>&1
+}
+vC() { printf '%s\n' "$1" | grep -m1 '^VERDICT: ' | sed 's/^VERDICT: //'; }
+
+RC="$RC" BASEC="$BASEC" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import plan_at_rev
+RC = os.environ["RC"]
+base = os.environ["BASEC"]
+bad = 0
+for name, got, want in [
+    ("plan_at_rev sees the plan at base", plan_at_rev(RC, base), True),
+    ("plan_at_rev reads a rev that does not resolve as unreadable, not absent",
+     plan_at_rev(RC, "0000000000000000000000000000000000000000"), None),
+    ("plan_at_rev on a repo that is not one is unreadable too",
+     plan_at_rev(os.path.join(RC, "no-such-dir"), "HEAD"), None),
+]:
+    if got is want: print("  PASS  %s" % name)
+    else: print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# The close itself: delete the plan, commit, push, CI green.
+git -C "$RC" rm -q WORKPLAN.md
+git -C "$RC" commit -qm "plan: series closed, WORKPLAN.md removed"
+
+# (1) deleted and committed but NOT pushed - not finished.
+gh_says "$RC" completed '"success"'
+out="$(scC)"
+check "deleted at HEAD but unpushed is not finished" "$(vC "$out")" "unclear"
+printf '%s\n' "$out" | grep -q "plan file : absent at HEAD | present at base" \
+  && ok "the report says the plan was present at base and is absent at HEAD" \
+  || bad "the report does not say where the plan was and was not"
+
+# (2) pushed, and CI on the tip is green - the close is finished.
+git -C "$RC" push -q origin live-graphs
+out="$(scC)"
+check "present at base, absent at HEAD, pushed and green -> finished (series closed)" \
+      "$(vC "$out")" "finished (series closed)"
+printf '%s\n' "$out" | grep -q "the series is closed" \
+  && ok "the plan section says the series is closed" \
+  || bad "the plan section does not say the series is closed"
+printf '%s\n' "$out" | grep -q "^  ci        : success: " \
+  && ok "the report prints the CI answer the verdict used" \
+  || bad "the report does not print the CI answer"
+
+# (3) CI pending on the pushed tip - not finished, and the reason says so.
+gh_says "$RC" in_progress 'null'
+out="$(scC)"
+check "pushed with CI pending is not finished" "$(vC "$out")" "unclear"
+printf '%s\n' "$out" | grep -q "CI on the pushed tip has not concluded" \
+  && ok "the why line names CI as what is missing" \
+  || bad "the why line does not name CI"
+
+# (4) gh unreadable - terminal, but it says the CI half is unchecked.
+gh_unavailable
+check "pushed with gh unreadable says CI is unverified" \
+      "$(vC "$(scC)")" "finished (series closed, CI unverified)"
+
+# (5) CI red - not finished.
+gh_says "$RC" completed '"failure"'
+check "pushed with CI red is not finished" "$(vC "$(scC)")" "unclear"
+
+# (6) a plan absent at base too is not a close.  Re-base the same report on the
+# closing commit: at THAT base there is no WORKPLAN.md either, so the absence
+# says nothing about this run - and with both batches' rows gone, every batch
+# is open, which is what keeps `finished` out of reach.
+gh_says "$RC" completed '"success"'
+out="$(SPANWEAVE_REPO="$RC" SPANWEAVE_TDIR="$TDC" \
+       SPANWEAVE_PINNED="cccccccc.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$(git -C "$RC" rev-parse HEAD)" \
+       SPANWEAVE_BRANCH=live-graphs SPANWEAVE_PIDS="" \
+       "$OPS_DIR/status_check.sh" --run 5 --batches "L23 L24" 2>&1)"
+printf '%s\n' "$(vC "$out")" | grep -qx "finished (series closed)" \
+  && bad "an absence that was already there at base is read as a series close" \
+  || ok "an absence that was already there at base is not a series close"
+printf '%s\n' "$out" | grep -q "this is not a" \
+  && ok "the plan section says why the absence is not a close" \
+  || bad "the plan section does not say why the absence is not a close"
+printf '%s\n' "$out" | grep -q "2 listed | 0 stopped | 2 open: L23, L24" \
+  && ok "with no rows and no close, every batch stays open" \
+  || bad "a non-close absence still leaves batches stopped"
+
+# (7) the watch agrees with the report: the same shape is terminal there, with
+# the same name, and the non-close absence does not fire at all.
+gh_says "$RC" completed '"success"'
+out="$(SPANWEAVE_STATE_DIR="$STC" SPANWEAVE_REPO="$RC" SPANWEAVE_TDIR="$TDC" \
+       SPANWEAVE_PINNED="cccccccc.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$BASEC" SPANWEAVE_BRANCH=live-graphs \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L23 L24" \
+       "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+check "the watch fires the close as terminal (exit 10)" "$?" "10"
+printf '%s\n' "$out" | grep -q "^>>> EVENT finished (series closed)\$" \
+  && ok "the watch's trigger name matches the report's verdict" \
+  || bad "the watch's trigger name does not match the report's verdict"
+
+rm -rf "$STC"; mkdir -p "$STC"
+out="$(SPANWEAVE_STATE_DIR="$STC" SPANWEAVE_REPO="$RC" SPANWEAVE_TDIR="$TDC" \
+       SPANWEAVE_PINNED="cccccccc.jsonl" SPANWEAVE_SELF="none.jsonl" \
+       SPANWEAVE_BASE="$(git -C "$RC" rev-parse HEAD)" \
+       SPANWEAVE_BRANCH=live-graphs \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L23 L24" \
+       "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+check "a non-close absence is not terminal in the watch either" "$?" "0"
+printf '%s\n' "$out" | grep -q "not a close" \
+  && ok "the poll banner says the absence is not a close" \
+  || bad "the poll banner does not say the absence is not a close"
+
+# ---------------------------------------------------------------------------
+echo
 echo "verdict - one of exactly six values, from evidence alone"
 # ---------------------------------------------------------------------------
 python3 - <<'PY'
@@ -1617,9 +1834,11 @@ TODO = {b: "todo" for b in B}
 DONE = {b: "done (`abc1234`)" for b in B}
 
 def V(statuses=TODO, source="worktree", batches=B, how="none", quiet_s=60,
-      pushed=False, asks=False, limit_hit=False, declared=()):
+      pushed=False, asks=False, limit_hit=False, declared=(),
+      base_had_plan=None, ci=None):
     return verdict(statuses, source, batches, how, quiet_s, pushed,
-                   asks, limit_hit, list(declared))[0]
+                   asks, limit_hit, list(declared),
+                   base_had_plan=base_had_plan, ci=ci)[0]
 
 cases = [
     # The exact state of run 3 when this session first checked it: rows all
@@ -1643,10 +1862,44 @@ cases = [
      V(statuses=DONE, pushed=False, how="derived", quiet_s=60), "applying plan"),
     ("all stopped, unpushed, nothing live -> unclear",
      V(statuses=DONE, pushed=False, how="derived", quiet_s=3600), "unclear"),
-    ("plan removed and pushed -> finished",
-     V(statuses={}, source="absent", pushed=True), "finished"),
-    ("plan removed but unpushed -> unclear",
-     V(statuses={}, source="absent", pushed=False), "unclear"),
+    # The series close: G4's last act removes WORKPLAN.md, so the run that
+    # ends the series ends with no rows to read.  It is finished on the same
+    # terms as any other run - pushed AND green - and the absence counts as a
+    # close only if there was a plan at base to delete.
+    ("plan present at base, removed at HEAD, pushed and green -> finished (series closed)",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=True, ci="success"),
+     "finished (series closed)"),
+    ("... unpushed is not finished",
+     V(statuses={}, source="absent", pushed=False, base_had_plan=True, ci="success"),
+     "unclear"),
+    ("... pushed with CI pending is not finished",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=True, ci="pending"),
+     "unclear"),
+    ("... pushed with CI red is not finished",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=True, ci="failure"),
+     "unclear"),
+    ("... pushed with gh unreadable says the CI half is unchecked",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=True, ci="unavailable"),
+     "finished (series closed, CI unverified)"),
+    ("... and a caller that never asked CI gets the same unverified answer",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=True),
+     "finished (series closed, CI unverified)"),
+    # A plan that was absent at base was never there to delete.  This is run
+    # 3's shape - a builder told to recreate WORKPLAN.md - and the old rule
+    # ("gone and pushed is finished") called it a finished run.
+    ("a plan absent at base and at HEAD is not a close: it falls through to the rows",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=False,
+       ci="success", how="derived", quiet_s=60), "unclear"),
+    # Not `underway` either: with no rows at all and batches committed, the
+    # no-row rule speaks first, and it is right to - a run whose batches are
+    # landing against a plan nobody can read is exactly what `unclear` is for.
+    # What matters is that it is not `finished`.
+    ("... and with a batch declared it is still not finished",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=False,
+       ci="success", how="derived", declared=["R1"]), "unclear"),
+    ("... and unreadable at base is not a close either",
+     V(statuses={}, source="absent", pushed=True, base_had_plan=None, ci="success"),
+     "unclear"),
     ("an unreadable plan -> unclear",
      V(statuses=None, source="unreadable"), "unclear"),
     # Asking about a finished run after the plan was recreated for the next one.
@@ -1671,7 +1924,10 @@ cases = [
 VOCAB = {"not started", "applying plan", "waiting on user", "finished", "unclear"}
 bad = 0
 for name, got, want in cases:
-    ok_v = got in VOCAB or got.startswith("underway: batch ")
+    # `underway: batch ...` and `finished (...)` are qualified members of the
+    # vocabulary, not new words: each begins with the word a caller matches on.
+    ok_v = (got in VOCAB or got.startswith("underway: batch ")
+            or got.startswith("finished ("))
     if got == want and ok_v: print("  PASS  %s" % name)
     else:
         print("  FAIL  %s\n        got %r want %r%s"

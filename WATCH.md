@@ -116,7 +116,9 @@ question no longer costs the watch.
 | trigger | terminal? | repeat policy |
 |---|---|---|
 | **finished** | yes, exit `10` | — |
+| **finished (series closed)** | yes, exit `10` | — |
 | **finished (CI unverified)** | yes, exit `10` | — |
+| **finished (series closed, CI unverified)** | yes, exit `10` | — |
 | **finished: CI red on `<sha>`** | yes, exit `15` | — |
 | **builder gone** | yes, exit `13` | — |
 | **tripwire** | no | per commit sha, once ever; `state/watch_state.json` keeps `reported_commits` |
@@ -164,7 +166,7 @@ brackets every event:
 | code | meaning |
 |---|---|
 | `0` | the invocation ran out its budget; non-terminal events may have been printed |
-| `10` | **finished** (terminal), and also **finished (CI unverified)** — same end state, an unread CI |
+| `10` | **finished** (terminal), and also **finished (series closed)** — the same end state reached with the plan deleted — and the two **(CI unverified)** forms of both, which are that end state with an unread CI |
 | `15` | **finished: CI red on `<sha>`** (terminal) |
 | `13` | **builder gone** (terminal) |
 | `2` | watcher error (no transcript was ever a candidate, `WORKPLAN.md` unreadable, unhandled exception) or bad usage |
@@ -352,16 +354,56 @@ failure, and the rows are looked for in three places in order:
 |---|---|---|
 | `worktree` | normal | rows as written |
 | `HEAD` | the deletion is staged but not yet committed | rows from the committed copy; the banner says `plan from HEAD` |
-| `absent` | gone from the worktree *and* from `HEAD` | no rows remain, so **nothing counts as open** and `finished` becomes reachable; the banner says `plan from absent` |
+| `absent` | gone from the worktree *and* from `HEAD` | no rows remain. Whether that is the **series close** depends on the base — see below; the banner says `plan absent (series closed)` or `plan absent, and absent too at base: not a close` |
 
 A file that *is* there and cannot be read is retried twice (the builder
 rewrites it in place between batches) and only then is a watcher error.
+
+### An absent plan is only a close if there was one at base
+
+Two states look identical to a reader of the worktree, and only one of them is
+a finished series:
+
+| at base | at HEAD | what it is |
+|---|---|---|
+| present | absent | the **series close** — this run deleted the plan |
+| absent | absent | a plan **not written yet** — nothing was deleted |
+
+The second is not hypothetical. Run 3's builder was started with *"recreate
+`WORKPLAN.md` from `git show c79cbc5:WORKPLAN.md`"*: no plan at base, and none
+at HEAD either until its plan commit landed. The old rule — "gone and pushed
+is finished" — called that a finished run.
+
+So the watch asks git whether `WORKPLAN.md` existed at `--base`
+(`plan_at_rev`), and that answer has **three** values, because "the plan was
+never there" and "we could not look" are different claims:
+
+| `plan_at_rev` | effect |
+|---|---|
+| present at base | the absence is the close: nothing counts as open, and `finished (series closed)` is reachable once the tip is pushed **and** green |
+| absent at base | **not** a close: there are no rows, so every listed batch stays open and `finished` is unreachable from the absence |
+| could not be read (the rev does not resolve, or git failed) | not a close either — the watch says so rather than guessing |
+
+`finished (series closed)` is a **qualified** `finished`, on the same terms as
+`underway: batch <ID> (in flight, uncommitted)`: same exit code, same terminal
+policy, and it still begins with `finished`, which is what a caller matches on.
+The qualifier is there because a closed series has *no batch rows left* — it
+says why the status block under it is empty, so an empty one is not read as the
+parser losing the rows again.
+
+And it is gated on CI exactly as any other `finished` is. A closed plan has no
+rows left to carry §0.1 step 8's second half, so the only evidence for green is
+what CI said about the pushed tip: **absent with the tip unpushed, or with CI
+pending or red, is not finished.**
 
 On 2026-09-10 04:25 the watch died `exit 2` in the second row of that table:
 G4 had staged the deletion, the working-tree file was gone, and the watcher
 treated a missing file as unreadable. Four `selftest.sh` cases now cover the
 staged deletion, the committed deletion, `finished` reached with the plan
-closed, and the still-an-error case.
+closed, and the still-an-error case — and a further section covers the close
+end to end: all four CI answers on a closed, pushed tip, and an absence that
+was already there at base, which is not a close in either the report or the
+watch.
 
 ## Liveness
 
@@ -474,7 +516,10 @@ prefix-matched now.
 **finished** *(terminal)* — `origin/<branch>` moved past the base, **and**
 local HEAD equals it, **and** no listed batch is `todo` or `in progress`,
 **and** CI concluded `success` on the pushed tip. `done`, `dropped`,
-`awaiting …`, `blocked …` all count as stopped. Evidence: the CI answer and
+`awaiting …`, `blocked …` all count as stopped. When there are no rows at all
+because this run **deleted** the plan, the same trigger fires as **finished
+(series closed)** — see *An absent plan is only a close if there was one at
+base*. Evidence: the CI answer and
 where it came from, `git log --oneline <base>..HEAD`, the status line for each
 listed batch, the resume-note tail, `git status --short`.
 
@@ -489,10 +534,10 @@ answer is**, in four shapes:
 
 | CI on the tip | trigger | exit |
 |---|---|---|
-| `success` | `finished` | `10` |
+| `success` | `finished`, or `finished (series closed)` where the run deleted the plan | `10` |
 | queued, running, or no workflow run for the sha yet | *none* — one note, and the poll loop continues | — |
 | any other conclusion (`failure`, `cancelled`, `timed_out`, …) | `finished: CI red on <sha>` | `15` |
-| `gh` could not be read at all | `finished (CI unverified)` | `10` |
+| `gh` could not be read at all | `finished (CI unverified)`, or `finished (series closed, CI unverified)` | `10` |
 
 *Pending is not news.* CI on a tip pushed seconds ago is queued by definition,
 so the pending case prints one `note:` line in the same shape as the other
@@ -586,7 +631,7 @@ commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to overrid
 
 ## Verified
 
-`./selftest.sh` — 232 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 267 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -594,12 +639,15 @@ and watcher prompts that must not be builders, and self-exclusion — including
 the case that *without* `CLAUDE_CODE_SESSION_ID` the watcher derives onto
 itself; the `95360def` drift from both pins; the run-3 row shapes, with an
 escaped pipe in the row and a sha on the status; the memo rule firing on a
-declaration and not on a citation; all six verdict values, including that
-`waiting on user` outranks an in-progress row but not a finished, pushed run;
+declaration and not on a citation; all six verdict values and both of
+`finished`'s qualifiers, including that `waiting on user` outranks an
+in-progress row but not a finished, pushed run;
 and every dedup path — tripwire once-per-sha, waiting
 once-then-`RESUMED`-then-again, stall once-then-40-min-then-again, and both
 terminal exits; the series-close cases, where `WORKPLAN.md` is deleted staged,
-then committed, then reached `finished` with the plan closed; and the two
+then committed, then reached `finished (series closed)` with the plan closed —
+pushed and green, and not on an unpushed tip, a pending CI or a red one, and
+not at all where the plan was already absent at the base; and the two
 derived defaults — the branch from the checkout, from an operator flag and from
 a detached HEAD, a poll with no `--branch` against a repo that is *not* on
 `audit-fixes` running clean while a given-but-wrong branch still trips the

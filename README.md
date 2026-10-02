@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 232 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches — all four CI answers behind `finished`, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
+| `selftest.sh` | 267 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
 
 ## What you have to pass, and what you do not
 
@@ -124,9 +124,10 @@ Self-test:
 ## What `status_check.sh` says
 
 The last line of the report is a **verdict**, drawn from a closed vocabulary
-of six values — one of which, `underway`, takes a qualifier saying which
-evidence carried it. Nothing else appears on that line, so a caller can match
-it exactly; the evidence it was derived from is printed underneath it.
+of six values — two of which, `underway` and `finished`, take a qualifier
+saying which evidence carried it. Nothing else appears on that line, so a
+caller can match it exactly; the evidence it was derived from is printed
+underneath it.
 
 | verdict | means | derived from |
 |---|---|---|
@@ -135,13 +136,18 @@ it exactly; the evidence it was derived from is printed underneath it.
 | `underway: batch <ID>` | a batch is being worked, and something has landed | a row says something other than `todo`/stopped, else the first still-open row once a commit since base has **declared** one of the run's batches |
 | `underway: batch <ID> (in flight, uncommitted)` | a batch is being worked and nothing has landed yet | the plan commit is pushed, **and** a builder sub-agent is live (`pendingBackgroundAgentCount ≥ 1`, or a `subagents/` file touched within the 40-min stall window), **and** the tree has uncommitted changes. `<ID>` is the first `todo` batch in the run's section-2 execution order |
 | `waiting on user` | blocked on a human | the last assistant entry asks a question, or a usage/rate-limit notice appears, **and** liveness has been still ≥ 10 min |
-| `finished` | the run is done | every batch stopped (or `WORKPLAN.md` gone) **and** HEAD is pushed |
-| `unclear` | the evidence does not settle it | an unreadable plan; a plan with no row for any batch of this run while some are committed; every batch stopped but HEAD unpushed with nothing live; a quiet derived builder that has declared nothing; a live one with the plan pushed, no row moved and nothing in flight |
+| `finished` | the run is done | every batch stopped **and** HEAD is pushed |
+| `finished (series closed)` | the run is done, and it was the one that closed the series | `WORKPLAN.md` was **present at `--base`** and is **absent at HEAD** — this run deleted it — **and** HEAD is pushed **and** CI on the pushed tip is green |
+| `finished (series closed, CI unverified)` | the same end state, with the CI half unread | all of the above except that `gh` could not be read, so nothing has verified green |
+| `unclear` | the evidence does not settle it | an unreadable plan; a plan with no row for any batch of this run while some are committed; every batch stopped but HEAD unpushed with nothing live; a quiet derived builder that has declared nothing; a live one with the plan pushed, no row moved and nothing in flight; **a deleted plan whose tip is unpushed, or whose CI is pending or red** |
 
-The qualified form is still `underway`, not a seventh word — it begins
-`underway: batch `, which is what a caller matches on. The parenthetical is
-there because it is a **weaker** claim than the unqualified one: no commit has
-declared the batch, so the evidence is activity, not a result.
+The qualified forms are still `underway` and `finished`, not new words — each
+begins with the word a caller matches on. `underway`'s parenthetical is there
+because it is a **weaker** claim than the unqualified one: no commit has
+declared the batch, so the evidence is activity, not a result. `finished`'s
+says why there are no batch rows printed underneath it — the last batch deleted
+them — so an empty status block is not read as the parser losing the rows
+again.
 
 `waiting on user` outranks everything except a finished, pushed run: a session
 blocked on a human is not advancing, whatever the rows say. A row that says
@@ -183,7 +189,7 @@ shapes, not two — and the three that end the watch say which one they are:
 
 | CI on the tip | what the watch does |
 |---|---|
-| success | fires `finished`, exit `10` |
+| success | fires `finished` — or `finished (series closed)`, where this run deleted the plan — exit `10` |
 | queued / running / no run for the sha yet | does not fire; one note, and the poll loop goes on |
 | any other conclusion | fires `finished: CI red on <sha>`, exit `15` |
 | `gh` could not tell us anything | fires `finished (CI unverified)`, exit `10` |
@@ -197,7 +203,9 @@ printing a `finished` that quietly means "we did not look".
 | trigger | stops the watch? | repeats? |
 |---|---|---|
 | **finished** | yes (exit `10`) | — |
+| **finished (series closed)** | yes (exit `10`) | — |
 | **finished (CI unverified)** | yes (exit `10`) | — |
+| **finished (series closed, CI unverified)** | yes (exit `10`) | — |
 | **finished: CI red on `<sha>`** | yes (exit `15`) | — |
 | **builder gone** | yes (exit `13`) | — |
 | **tripwire** | no | each commit sha once, ever |
@@ -222,17 +230,40 @@ RESUMED after stall (quiet 51.0 min): liveness 02:10:04 -> 03:01:12; HEAD a9f6fd
 ## The series ends by deleting the plan
 
 G4, the last batch, removes `WORKPLAN.md`. The watch reads the rows from the
-working tree, else from `HEAD` while the deletion is staged, else treats the
-plan as **closed** — no rows, nothing open, `finished` reachable. A missing
-plan is never a watcher error; a present-but-unreadable one still is, after two
-retries.
+working tree, else from `HEAD` while the deletion is staged, else there are no
+rows at all. A missing plan is never a watcher error; a present-but-unreadable
+one still is, after two retries.
+
+**No rows is not by itself a closed series.** Two states look identical to a
+reader of the worktree:
+
+| at `--base` | at HEAD | what it is |
+|---|---|---|
+| present | absent | the **close** — this run deleted the plan |
+| absent | absent | a plan **not written yet** — nothing was deleted |
+
+The second is run 3's shape: its builder was started with *"recreate
+`WORKPLAN.md` from `git show c79cbc5:WORKPLAN.md`"*, so it had no plan at base
+and none at HEAD either until its plan commit landed. The old rule — "gone and
+pushed is finished" — called that a finished run. So the absence is read
+against git's answer for the base commit, and that answer has three values:
+present (the close), absent (not a close — every batch stays open and
+`finished` is unreachable from the absence), and **could not be read**, which
+is not treated as either.
+
+A close is `finished` on exactly the same terms as a run with rows: **pushed
+and green.** A closed plan has no rows left to carry `WORKPLAN.md` 0.1 step
+8's second half, so the only evidence for green is CI on the pushed tip —
+absent with the tip unpushed, or with CI pending or red, is **not** finished.
+`status_check.sh` asks `gh` for exactly this case and no other, and prints the
+answer it used on a `ci :` line.
 
 ## Exit codes
 
 | code | meaning |
 |---|---|
 | `0` | invocation ran its budget out; non-terminal events may have been reported |
-| `10` | **finished** — origin moved past base, HEAD matches it, no batch still open, and CI on the tip concluded success. Also the code for **finished (CI unverified)**, where all of that holds but `gh` could not be read |
+| `10` | **finished** — origin moved past base, HEAD matches it, no batch still open, and CI on the tip concluded success. Also the code for **finished (series closed)**, which is that end state reached by *deleting* the plan, and for the **(CI unverified)** form of either, where all of it holds but `gh` could not be read |
 | `15` | **finished: CI red on `<sha>`** — the push landed and every batch stopped, but CI on the pushed tip concluded something other than success |
 | `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete. An **empty** arming set cannot shrink, so the trigger has no signal; every poll banner says `no PID set: 'builder gone' disarmed` rather than looking quiet |
 | `2` | watcher error (no transcript in the directory was ever a candidate for this run, `WORKPLAN.md` unreadable, unhandled exception) or bad usage. A directory whose candidates were all refused by the **base-time floor** is *not* this: the watch keeps polling with liveness unknown |

@@ -806,6 +806,36 @@ def workplan_statuses(repo):
     return out, raw, source
 
 
+def plan_at_rev(repo, rev):
+    """Was WORKPLAN.md in the tree at `rev`?  -> True | False | None.
+
+    `None` is "could not be read" - a rev that does not resolve, or a git that
+    failed - and is deliberately not False: "the plan was never there" and "we
+    could not look" are different claims, and only the first of them says
+    anything about whether a series closed.
+
+    This is what makes an absent plan legible.  The series ends by *deleting*
+    WORKPLAN.md (G4), so "no plan at HEAD" is the end state of a closed series
+    - but only if there was a plan at the base commit to delete.  A run that
+    *begins* by recreating the plan (run 3's builder was started with `recreate
+    WORKPLAN.md from git show c79cbc5:WORKPLAN.md`) has no plan at base and,
+    until its plan commit lands, none at HEAD either.  Those two states look
+    identical to a reader of the worktree, and the old rule - "gone and pushed
+    is finished" - called the second one a finished run.
+    """
+    git = git_in(repo)
+    rc, _, _ = git("cat-file", "-e", "%s:WORKPLAN.md" % rev)
+    if rc == 0:
+        return True
+    # `cat-file -e` fails the same way for "no such path in that tree" and for
+    # "no such tree", so ask whether the rev resolves at all before reading the
+    # failure as an absence.
+    rc2, _, _ = git("rev-parse", "--verify", "%s^{commit}" % rev)
+    if rc2 != 0:
+        return None
+    return False
+
+
 def is_stopped(status):
     """Prefix-matched, all four words.  The plan does not write a bare `done`:
     it writes ``done (`0e4262e`)``, and the exact-match test on "done" and
@@ -846,6 +876,15 @@ V_UNDERWAY    = "underway: batch %s"
 V_UNDERWAY_INFLIGHT = "underway: batch %s (in flight, uncommitted)"
 V_WAITING     = "waiting on user"
 V_FINISHED    = "finished"
+# Two more qualified `finished`es, on the same terms as the qualified
+# `underway` above: both begin with `finished`, which is what a caller matches
+# on, and the parenthetical says what is different about this one.  Here it is
+# the *reason there are no rows to read* - the last batch deleted the plan - so
+# a reader is not left wondering why a finished run reports no batch statuses.
+V_FINISHED_CLOSED = "finished (series closed)"
+# ... and the "we did not look" form, for the same reason the finished trigger
+# has one: `gh` being unreadable is not evidence that CI passed.
+V_FINISHED_CLOSED_UNVERIFIED = "finished (series closed, CI unverified)"
 V_UNCLEAR     = "unclear"
 
 
@@ -865,7 +904,8 @@ def first_todo(statuses, batches):
 
 def verdict(statuses, source, batches, how, quiet_s, pushed,
             asks, limit_hit, declared_since_base,
-            head_past_base=True, pending=None, sub_quiet_s=None, dirty=False):
+            head_past_base=True, pending=None, sub_quiet_s=None, dirty=False,
+            base_had_plan=None, ci=None):
     """-> (verdict line, one-line reason).
 
     Pure: every argument is evidence already gathered by the caller, so the
@@ -887,6 +927,12 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
       pending             last pendingBackgroundAgentCount seen, or None
       sub_quiet_s         seconds since the newest file under `subagents/`
       dirty               the working tree has uncommitted changes
+      base_had_plan       WORKPLAN.md existed at the base commit: True | False
+                          | None ("could not be read" - see `plan_at_rev`)
+      ci                  what CI concluded on the pushed tip, as
+                          `ci_conclusion` reports it: "success" | "pending" |
+                          "failure" | "unavailable" | None (not asked, which
+                          counts as unverified, never as green)
 
     **Why the last four exist.** On 2026-09-30 a run-2 check reported `applying
     plan` while batch L3's sub-agent was three edits into `spanweave/ids.py`.
@@ -911,10 +957,37 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
                            if asks else
                            "a usage/rate-limit notice is in the recent entries")
 
-    if source == "absent":
-        if pushed:
-            return V_FINISHED, "WORKPLAN.md is gone and HEAD is pushed"
-        return V_UNCLEAR, "WORKPLAN.md is gone but HEAD is not pushed"
+    # A closed series has no rows to read: G4's last act is to remove
+    # WORKPLAN.md, so the run that finishes the series ends with the parser
+    # looking at a file that is not there.  That absence is the end state - but
+    # it is only *this* run's end state if there was a plan at base to delete,
+    # and it is only *finished* on the same terms as every other finished run:
+    # pushed AND green (WORKPLAN.md 0.1 step 8).  An absence that was already
+    # there at base is not a close at all, and falls through to the ordinary
+    # rules below with no rows - where `active` is the whole batch list, so
+    # `finished` is unreachable.  That is the run-3 shape: a builder told to
+    # recreate the plan has no WORKPLAN.md at base, and none at HEAD either
+    # until its plan commit lands.
+    if source == "absent" and base_had_plan:
+        if not pushed:
+            return V_UNCLEAR, ("WORKPLAN.md was removed since base - the series "
+                               "close - but HEAD is not pushed")
+        if ci == "success":
+            return V_FINISHED_CLOSED, ("WORKPLAN.md was present at base and is gone "
+                                       "at HEAD, HEAD is pushed and CI on it is green")
+        if ci == "pending":
+            return V_UNCLEAR, ("the series close is pushed but CI on the pushed tip "
+                               "has not concluded")
+        if ci == "failure":
+            return V_UNCLEAR, ("the series close is pushed but CI on the pushed tip "
+                               "did not pass, so 0.1 step 8 is not met")
+        return V_FINISHED_CLOSED_UNVERIFIED, (
+            "WORKPLAN.md was present at base and is gone at HEAD and HEAD is "
+            "pushed, but CI on it was not read (%s)" % (ci or "not asked"))
+    if source == "absent" and base_had_plan is None:
+        return V_UNCLEAR, ("WORKPLAN.md is gone at HEAD, but whether it existed at "
+                           "base could not be read, so this is not a close we can "
+                           "claim")
 
     # A plan that is present but has no row for any batch of this run is not
     # describing this run.  Asking a run-2 question after run 3 recreated
@@ -922,8 +995,12 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
     # rows defaulting to todo - and then "underway: batch A5" for a run that
     # finished a day earlier.  Absent rows are the absence of evidence.
     if not any(b in statuses for b in batches) and declared_since_base:
-        return V_UNCLEAR, ("WORKPLAN.md has no row for any batch of this run, "
-                           "yet %d of them are committed" % len(declared_since_base))
+        return V_UNCLEAR, (
+            ("WORKPLAN.md is absent at base and at HEAD, so there is no row for any "
+             "batch of this run, yet %d of them are committed"
+             if source == "absent" else
+             "WORKPLAN.md has no row for any batch of this run, yet %d of them are "
+             "committed") % len(declared_since_base))
 
     active = [b for b in batches if not is_stopped(statuses.get(b, "todo"))]
 
@@ -992,7 +1069,10 @@ def resume_note_tail(repo, n=12):
     if lines is None:
         return ["<WORKPLAN.md unreadable>"]
     if source == "absent":
-        return ["<WORKPLAN.md removed - the series is closed>"]
+        # Not "the series is closed": this function cannot see the base, and an
+        # absent plan is a close only if there was one at base to delete.  The
+        # verdict line says which; this just says there is nothing to read.
+        return ["<WORKPLAN.md is absent - no rows and no resume note to read>"]
     start = None
     for i, line in enumerate(lines):
         if line.startswith("## 4. Resume note"):

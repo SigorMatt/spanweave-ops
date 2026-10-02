@@ -73,7 +73,8 @@ from watch_lib import (HOW_FLOOR, STALL_QUIET_S, WAIT_QUIET_S, age, asks_questio
                        claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
-                       newest_under, pending_agents, render, resume_note_tail,
+                       newest_under, pending_agents, plan_at_rev, render,
+                       resume_note_tail,
                        stamp, subagents_dir, substantive, tail_entries,
                        workplan_statuses)
 
@@ -234,11 +235,20 @@ def main():
         event("watcher error",
               "WATCHER ERROR: WORKPLAN.md is present but unreadable at %s" % REPO)
         return ERROR, events, st
-    if plan_src == "absent":
+    # Did the base commit have a plan?  Only then is "no plan at HEAD" G4's
+    # series close rather than a plan that has not been written yet - see
+    # `plan_at_rev`. Read once per poll, from git, so a `--base` the operator
+    # changed between polls changes this answer too.
+    base_had_plan = plan_at_rev(REPO, BASE)
+    series_closed = (plan_src == "absent" and base_had_plan is True)
+    if series_closed:
         # G4's row is "Series close: ... remove WORKPLAN.md". A closed plan has
         # no rows, so nothing is active - that is the end state, not an error.
         active = []
     else:
+        # Including an absent plan that was already absent at base: it has no
+        # rows either, but it is not a close, so every batch stays open and
+        # `finished` cannot fire off the absence.
         active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
 
     # -- processes -----------------------------------------------------------
@@ -247,6 +257,20 @@ def main():
     missing_pids = [p for p in PIDSET if p not in running]
 
     obs = {"live": live, "head": head, "idx": idx_m, "commit": last_commit_epoch}
+
+    # Where the rows came from, and - when there are none - whether that is the
+    # series close.  An absence that is NOT a close is the surprising state, so
+    # it says so on every banner rather than only inside a trigger's evidence.
+    if plan_src == "worktree":
+        plan_where = ""
+    elif plan_src != "absent":
+        plan_where = "from %s" % plan_src
+    elif series_closed:
+        plan_where = "absent (series closed)"
+    else:
+        plan_where = ("absent, and %s at base: not a close"
+                      % ("absent too" if base_had_plan is False
+                         else "unreadable there"))
 
     # -- per-poll banner -----------------------------------------------------
     suppressed = [k for k in ("waiting", "stall") if st.get(k)]
@@ -259,7 +283,7 @@ def main():
                  LIVENESS_UNKNOWN if unknown_liveness
                  else "liveness %s (%s ago)" % (stamp(live), age(live, now)),
                  pending, ",".join(active) if active else "(none)",
-                 ("%s%s%s" % (" | plan from %s" % plan_src if plan_src != "worktree" else "",
+                 ("%s%s%s" % (" | plan %s" % plan_where if plan_where else "",
                               " | suppressed: %s" % ",".join(suppressed) if suppressed else "",
                               # A lost terminal trigger is worth a per-poll
                               # reminder: an empty set can never shrink.
@@ -272,9 +296,16 @@ def main():
         pass
 
     def status_block():
+        if series_closed:
+            return ("  WORKPLAN.md was present at base %s and has been removed, so\n"
+                    "  the series is closed: no batch row remains and nothing counts\n"
+                    "  as active." % BASE)
         if plan_src == "absent":
-            return ("  WORKPLAN.md has been removed - the series is closed, so no\n"
-                    "  batch row remains and nothing counts as active.")
+            return ("  WORKPLAN.md is absent at HEAD and %s at base %s, so this is not\n"
+                    "  a series close: there are no rows to read, and every batch of\n"
+                    "  this run stays open."
+                    % ("was absent" if base_had_plan is False
+                       else "could not be read", BASE))
         rows = ["  %-3s %s" % (b, statuses.get(b, "<row missing>")) for b in BATCHES]
         if plan_src != "worktree":
             rows.insert(0, "  (rows read from %s: the working-tree file is gone)" % plan_src)
@@ -487,14 +518,27 @@ def main():
             # seconds ago is queued by definition.  One note, the shape the
             # other "cannot fire this poll" notes already use, and the loop
             # goes on polling.
-            print("  note: pushed, every batch stopped, but CI on %s has not concluded"
-                  " (%s) - 'finished' cannot fire this poll" % (headshort, ci_why),
+            print("  note: pushed, %s, but CI on %s has not concluded"
+                  " (%s) - 'finished%s' cannot fire this poll"
+                  % ("the series close landed" if series_closed
+                     else "every batch stopped",
+                     headshort, ci_why,
+                     " (series closed)" if series_closed else ""),
                   flush=True)
         else:
             red = (ci_state == "failure")
-            kind = ("finished: CI red on %s" % headshort if red
-                    else "finished" if ci_state == "success"
-                    else "finished (CI unverified)")
+            # A qualified `finished`, not a new terminal: same exit code, same
+            # terminal policy, and it still begins with `finished`.  What the
+            # qualifier adds is why there are no batch rows under it - the last
+            # batch deleted the plan - so a reader does not take an empty
+            # status block for a parser that lost the rows again.
+            if red:
+                kind = "finished: CI red on %s" % headshort
+            elif ci_state == "success":
+                kind = "finished (series closed)" if series_closed else "finished"
+            else:
+                kind = ("finished (series closed, CI unverified)" if series_closed
+                        else "finished (CI unverified)")
             L = []
             L.append("TRIGGER: %s  (terminal, watch stops)" % kind)
             L.append(header)

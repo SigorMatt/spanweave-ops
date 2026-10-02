@@ -47,10 +47,12 @@ python3 - <<'PY'
 import os, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (ARM_CMD_PREFIX, HOW_FLOOR, age, asks_question, claude_processes,
+from watch_lib import (ARM_CMD_PREFIX, HOW_FLOOR, age, asks_question,
+                       ci_conclusion, claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
-                       newest_under, pending_agents, resume_note_tail, stamp,
+                       newest_under, pending_agents, plan_at_rev,
+                       resume_note_tail, stamp,
                        subagents_dir, substantive, tail_entries, verdict,
                        workplan_statuses)
 
@@ -132,11 +134,23 @@ statuses, _raw, plan_src = workplan_statuses(REPO)
 if statuses is None:
     print("WATCHER ERROR: WORKPLAN.md is present but unreadable at %s" % REPO)
     sys.exit(2)
-if plan_src == "absent":
+# Only a plan that was there at base can have been deleted by G4, and only
+# then is "no plan at HEAD" the series close rather than a plan not yet
+# written - see `plan_at_rev`.
+base_had_plan = plan_at_rev(REPO, BASE)
+series_closed = (plan_src == "absent" and base_had_plan is True)
+if series_closed:
     # G4 removes WORKPLAN.md on series close; a closed plan has no active batch.
     active = []
-    print("  WORKPLAN.md has been removed - the series is closed, so no batch")
-    print("  row remains and nothing counts as active.")
+    print("  WORKPLAN.md was present at base %s and has been removed, so" % BASE)
+    print("  the series is closed: no batch row remains and nothing counts as active.")
+elif plan_src == "absent":
+    # No rows either, but no close: every batch of the run stays open, so
+    # nothing here can read the absence as a finished run.
+    active = list(BATCHES)
+    print("  WORKPLAN.md is absent at HEAD and %s at base %s, so this is not a"
+          % ("was absent" if base_had_plan is False else "could not be read", BASE))
+    print("  series close: there are no rows to read, and every batch stays open.")
 else:
     active = [b for b in BATCHES if not is_stopped(statuses.get(b))]
     if plan_src != "worktree":
@@ -286,10 +300,22 @@ head_past_base = bool([x for x in shas.splitlines() if x.strip()])
 sub_quiet_s = (now - s_m) if s_m else None
 dirty_paths = [x for x in statusshort.splitlines() if x.strip()]
 
+# CI on the pushed tip, asked for exactly where it can change the answer: a
+# closed series that is pushed.  WORKPLAN.md 0.1 step 8 ends a run at pushed
+# AND green, and a closed plan has no rows left to carry that evidence, so the
+# only way `finished (series closed)` can be honest is to ask.  Anywhere else
+# the verdict does not depend on it, and a one-shot report has no business
+# shelling out to `gh` to print a line it will not use.
+if series_closed and is_pushed:
+    ci_state, ci_why = ci_conclusion(REPO, BRANCH, headsha)
+else:
+    ci_state, ci_why = None, "not asked (only a pushed, closed series needs it)"
+
 v, why = verdict(statuses, plan_src, BATCHES, how, quiet_s, is_pushed,
                  asks, bool(limit_hit), declared_since_base,
                  head_past_base=head_past_base, pending=pending,
-                 sub_quiet_s=sub_quiet_s, dirty=bool(dirty_paths))
+                 sub_quiet_s=sub_quiet_s, dirty=bool(dirty_paths),
+                 base_had_plan=base_had_plan, ci=ci_state)
 
 if is_pushed:
     pushed_txt = "pushed"
@@ -317,6 +343,11 @@ print("  in flight : pendingBackgroundAgentCount=%s | subagents/ %s | tree %s"
          if dirty_paths else "clean"))
 print("  head      : %s %s | branch %s | plan rows from %s"
       % (headshort, pushed_txt, curbranch, plan_src))
+print("  plan file : %s at HEAD | %s at base %s%s"
+      % ("absent" if plan_src == "absent" else "present (%s)" % plan_src,
+         {True: "present", False: "absent", None: "unreadable"}[base_had_plan],
+         BASE, " -> series closed" if series_closed else ""))
+print("  ci        : %s: %s" % (ci_state or "unasked", ci_why))
 if missing_pids:
     print("  processes : %d of %d arming PIDs missing: %s"
           % (len(missing_pids), len(PIDSET),
