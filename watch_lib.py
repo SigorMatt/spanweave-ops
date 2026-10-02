@@ -448,6 +448,22 @@ HOW_DERIVED = "derived"
 HOW_PIN     = "pin (no candidate)"
 HOW_NONE    = "none"
 HOW_FLOOR   = "none (older than base)"
+# The floor read forwards instead of backwards.  A run number is a fact about
+# *some* run; a date is a fact about *this* one (see the 2026-10-01 note in
+# `derive_transcript`).  So where no prompt names run N - because the stored
+# `lastPrompt` is capped at ~200 characters and the run number lay beyond the
+# cut, or because the builder rolled from the previous run's last prompt
+# straight into this one - but exactly one transcript is about `WORKPLAN.md`,
+# is not an aux prompt, and was written *since the base commit*, that one is
+# the builder's, and it says on every banner which evidence carried it.  It
+# begins with `derived`, because that is what it is, and a caller matching the
+# derivations matches on that word.
+HOW_FLOOR_DERIVED = "derived by floor, not by run number"
+# ... and two of them is not an answer.  The floor can say "since this run
+# started"; it cannot pick between two sessions that both were.  Guessing here
+# is the 2026-10-01 drift with a new cause, so this is the watcher error it
+# looks like, with both files named so the operator can pin one.
+HOW_AMBIGUOUS = "none (two or more clear the floor)"
 
 
 def liveness_unknown_for_base(cfg):
@@ -507,6 +523,11 @@ def derive_transcript(cfg):
     # fact about this run, where a run number is only a fact about some run.
     base_at = base_author_time(cfg["repo"], cfg["base"])
     cands, rejected, floored = [], [], False
+    # The fallback pool: every transcript that is about the plan, does not
+    # announce itself as an aux session, and was last written since the base
+    # commit - whatever run number it names or fails to name.  Collected on
+    # this same pass, so the fallback costs no second sweep of the directory.
+    floor_clear = []
     for path in sorted(glob.glob(os.path.join(cfg["tdir"], "*.jsonl"))):
         name = os.path.basename(path)
         lp = last_prompt(path)
@@ -519,6 +540,23 @@ def derive_transcript(cfg):
             continue
         if not lp:
             continue
+        # Every candidate is plan-shaped - `is_builder_prompt` requires a
+        # non-aux prompt that matches PLAN_RE on both its branches - so one
+        # `last_write` here serves the candidate test, the floor and the pool.
+        plan_shaped = (not is_aux_prompt(lp)) and bool(PLAN_RE.search(lp))
+        lw = own_m = sub_m = None
+        clears_floor = False
+        if plan_shaped:
+            lw, own_m, sub_m = last_write(cfg["tdir"], name)
+            clears_floor = (base_at is None) or (lw >= base_at)
+            # The pool needs the floor to have actually *said* something.  With
+            # no readable base author time the floor refuses nothing, so
+            # "clears the floor" would mean "exists" - no warrant at all, and
+            # certainly not one to derive a session the run number disowns.
+            # The fallback is then simply unavailable, which is the answer the
+            # watcher gave before it existed.
+            if clears_floor and base_at is not None:
+                floor_clear.append((sub_m or 0.0, own_m or 0.0, name, lp))
         if not is_builder_prompt(lp, run):
             # One near miss is worth printing: a prompt about the plan, not an
             # aux one, naming no operative run N - and cut off at the stored
@@ -528,8 +566,7 @@ def derive_transcript(cfg):
             # from the floor's, so the two are distinguishable in this list.
             # Prompts that are short enough to be whole are not listed: they
             # really do not name the run, and the directory holds dozens.
-            if (lp and not is_aux_prompt(lp) and PLAN_RE.search(lp)
-                    and truncated_prompt(lp)):
+            if plan_shaped and truncated_prompt(lp):
                 named = sorted(set(int(x) for x in RUNNUM_RE.findall(lp)))
                 rejected.append(
                     (name, "lastPrompt is about WORKPLAN.md but names no operative "
@@ -551,8 +588,7 @@ def derive_transcript(cfg):
             rejected.append((name, "lastPrompt names run %s, never run %d"
                              % (", ".join(str(x) for x in other), run)))
             continue
-        lw, own_m, sub_m = last_write(cfg["tdir"], name)
-        if base_at is not None and lw < base_at:
+        if not clears_floor:
             # The floor.  Reported, not dropped: this is the near miss, and a
             # reader has to be able to see which file nearly won and by how
             # many days it missed.
@@ -590,6 +626,43 @@ def derive_transcript(cfg):
         pin = os.path.join(cfg["tdir"], cfg["pinned"])
         if os.path.exists(pin):
             return cfg["pinned"], last_prompt(pin), cands, HOW_PIN, rejected
+    # No prompt named run N.  Read the floor forwards: among the transcripts
+    # that are about the plan, are not aux prompts and were written since the
+    # base commit, exactly one is an answer and two are not.
+    #
+    # Why this is not the run-number rule giving up.  On 2026-10-02 run 5 of
+    # the live-graphs series had landed L23, pushed it, and was mid-L24 with a
+    # sub-agent live, and no transcript in the directory named run 5: the
+    # builder was the session that had been told to apply the *run-4* review
+    # decisions, had made the base commit itself, and rolled straight on into
+    # run 5 without a new prompt.  Its stored `lastPrompt` names run 4 and is
+    # cut at the 200-character cap, so no later "run 5" could be stored
+    # either.  Both entry points answered "no builder transcript found for run
+    # 5" and exited 2, about a run whose builder was alive, pinned by nothing,
+    # and the only session in the directory written since the base.
+    #
+    # The floor is the evidence that makes that safe to act on.  A run number
+    # is a fact about some run; "written since this run's base commit" is a
+    # fact about this one, and it is the same fact the floor already trusts in
+    # the other direction when it refuses a twenty-day-old candidate.
+    floor_clear.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
+    if len(floor_clear) == 1:
+        sub_m, own_m, name, lp = floor_clear[0]
+        # It is chosen, so it must not also be listed as refused: it appears in
+        # `rejected` from the near-miss branch above, which is now the wrong
+        # thing to say about it.
+        rejected = [r for r in rejected if r[0] != name]
+        return name, lp, list(floor_clear), HOW_FLOOR_DERIVED, rejected
+    if len(floor_clear) > 1:
+        for _sm, _om, name, lp in floor_clear:
+            rejected = [r for r in rejected if r[0] != name]
+            rejected.append(
+                (name, "names no operative run %d, but is about WORKPLAN.md, is "
+                       "not an aux prompt and was written since the base - and so "
+                       "are %d others, so the floor cannot pick between them: "
+                       "name one with SPANWEAVE_PINNED=<uuid>.jsonl"
+                 % (run, len(floor_clear) - 1)))
+        return None, None, list(floor_clear), HOW_AMBIGUOUS, rejected
     # No candidate and no pin.  The two ways of getting here are different
     # answers and must not be reported as the same one: HOW_FLOOR means
     # candidates existed and the floor refused them all, so liveness is unknown
@@ -914,10 +987,12 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
       statuses            {batch id: status} from WORKPLAN.md section 1
       source              "worktree" | "HEAD" | "absent" | "unreadable"
       batches             the run's batch list, in section 2's execution order
-      how                 HOW_DERIVED | HOW_PIN | HOW_FLOOR | HOW_NONE.  Only
-                          HOW_DERIVED means "a session for this run is visible";
-                          the floor's answer reads as no transcript here, which
-                          is what it is from the verdict's point of view
+      how                 HOW_DERIVED | HOW_FLOOR_DERIVED | HOW_PIN |
+                          HOW_FLOOR | HOW_NONE | HOW_AMBIGUOUS.  Only the two
+                          that begin with `derived` mean "a session for this
+                          run is visible"; the floor's and the ambiguity's
+                          answers read as no transcript here, which is what
+                          they are from the verdict's point of view
       quiet_s             seconds since the newest liveness signal, or None
       pushed              HEAD == origin/<branch>
       asks / limit_hit    the two "waiting on user" signals
@@ -1051,7 +1126,8 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
     # Nothing has moved on any batch and nothing is in flight.  `applying plan`
     # is now only what its name says - the run's plan commit is absent or not
     # pushed - and the transcript is what separates that from not started.
-    if how == "derived" and live:
+    derived = (how or "").startswith("derived")
+    if derived and live:
         if not head_past_base:
             return V_APPLYING, "a builder for this run is live and no plan commit exists yet"
         if not pushed:
@@ -1059,7 +1135,7 @@ def verdict(statuses, source, batches, how, quiet_s, pushed,
         return (V_UNCLEAR,
                 "the plan commit is pushed and a builder is live, but no batch is "
                 "declared, no row has moved and nothing is in flight")
-    if how == "derived":
+    if derived:
         return V_UNCLEAR, "a builder for this run exists but is quiet and has declared nothing"
     return V_NOT_STARTED, "no builder transcript for this run, and no batch declared"
 

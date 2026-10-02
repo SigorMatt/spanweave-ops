@@ -68,7 +68,8 @@ while :; do
 import json, os, re, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (HOW_FLOOR, STALL_QUIET_S, WAIT_QUIET_S, age, asks_question,
+from watch_lib import (HOW_AMBIGUOUS, HOW_FLOOR, HOW_FLOOR_DERIVED,
+                       STALL_QUIET_S, WAIT_QUIET_S, age, asks_question,
                        base_author_time, ci_conclusion,
                        claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
@@ -184,8 +185,19 @@ def main():
     unknown_liveness = (tname is None and how == HOW_FLOOR)
     base_at = base_author_time(REPO, BASE) if unknown_liveness else None
     if tname is None and not unknown_liveness:
-        event("watcher error",
-              "WATCHER ERROR: no builder transcript found for run %d in %s" % (RUN, TDIR))
+        L = ["WATCHER ERROR: no builder transcript found for run %d in %s"
+             % (RUN, TDIR)]
+        if how == HOW_AMBIGUOUS:
+            # Not "nothing matched": too much did.  Two or more sessions are
+            # about the plan and were written since the base, and the floor
+            # cannot pick between them - so both are named, because the fix is
+            # for the operator to pin one.
+            L.append("  No prompt names run %d, and %d transcripts clear the"
+                     % (RUN, len(cands)))
+            L.append("  base-time floor, so the floor cannot derive one either:")
+            for name, why in rejected:
+                L.append("  %s  %s" % (name, why))
+        event("watcher error", "\n".join(L))
         return ERROR, events, st
     if unknown_liveness:
         tpath = sub = None
@@ -274,11 +286,17 @@ def main():
 
     # -- per-poll banner -----------------------------------------------------
     suppressed = [k for k in ("waiting", "stall") if st.get(k)]
-    banner = ("poll %s | run %d | watching %s%s | HEAD %s | origin %s | %s"
+    # A derivation that did NOT come from a run number says so on every poll,
+    # not once at arming: it is a weaker warrant than `derived`, and a reader
+    # skimming a banner must not have to remember which rule chose the file.
+    how_note = ("  <-- %s" % HOW_FLOOR_DERIVED if how == HOW_FLOOR_DERIVED
+                else "")
+    banner = ("poll %s | run %d | watching %s%s%s | HEAD %s | origin %s | %s"
               " | pendingBackgroundAgentCount=%s | open: %s%s"
               % (stamp(now), RUN,
                  tname or "(no transcript newer than base)",
                  "  <-- FOLLOWED (pin was %s)" % PINNED if followed else "",
+                 how_note,
                  headshort, origin[:7] if origin else "?",
                  LIVENESS_UNKNOWN if unknown_liveness
                  else "liveness %s (%s ago)" % (stamp(live), age(live, now)),

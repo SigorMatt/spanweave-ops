@@ -303,13 +303,64 @@ floor by then, so neither can be a previous series' session.
 With no candidate the configured pin is used — an operator override, so it is
 re-tested against neither the run number **nor** the floor.
 
-With no candidate and no pin there are two different answers, and they are not
-reported as one:
+### The floor, read forwards
+
+With no candidate and no pin, the floor is asked the *other* question. Not
+"which of these is too old" but "which of these was written since this run
+began" — and among the transcripts that
+
+1. are about `WORKPLAN.md`, **and**
+2. do not open by announcing themselves as a reviewer or a watcher, **and**
+3. are not this session's own or a known past aux one, **and**
+4. were last written **at or after** the base commit's author time,
+
+**exactly one is an answer, and two are not.** The one is derived, and says so
+on every banner and in the report: `derived by floor, not by run number`.
+
+*Why.* On 2026-10-02 run 5 of the live-graphs series had landed L23, pushed it,
+and was mid-L24 with a sub-agent live — and no transcript in the directory
+named run 5. The builder was the session that had been told to apply the
+**run-4** review decisions: it made the base commit itself and rolled straight
+on into run 5 without a new prompt, so its stored `lastPrompt` names run 4 and
+is cut at the 200-character cap, where no later "run 5" could be stored either.
+Both entry points answered *"no builder transcript found for run 5"* and exited
+`2`, about a run whose builder was alive, pinned by nothing, and the only
+session in the directory written since the base.
+
+A run number is a fact about *some* run; "written since this run's base commit"
+is a fact about *this* one. That is the same reasoning the floor already uses to
+refuse a twenty-day-old candidate, pointed the other way — so the fallback's
+warrant is the floor itself, which is why it names the floor in its own `how`
+and why `status_check.sh` prints the reason next to the file it chose.
+
+What the fallback drops is rule 2 (the run number) and nothing else. The aux
+test, the self test and the floor all still stand, and each is pinned by a
+`selftest.sh` case: an aux prompt newer than the base is still refused, a
+post-base transcript that never mentions the plan is not in the pool, and the
+watcher's own session never is.
+
+**Two is not an answer.** The floor can say "since this run started"; it cannot
+pick between two sessions that both were, and the newest-of-two guess is the
+2026-10-01 drift with a new cause. So two or more leaves the watcher error
+exactly where it was — exit `2` in both entry points — with **both** files
+named and `SPANWEAVE_PINNED=<uuid>.jsonl` offered, because an operator naming
+one is evidence the watcher does not have.
+
+**No readable base, no fallback.** A base the repo cannot resolve yields no
+floor at all, so "clears the floor" would degrade to "exists" — no warrant
+whatever. The fallback is then simply unavailable, and the answer is the one
+the watcher gave before it existed.
+
+A pin outranks all of this, as it already outranks the run number.
+
+With no candidate, no pin and no floor derivation there are three different
+answers, and they are not reported as one:
 
 | | means | watch |
 |---|---|---|
 | nothing was ever a candidate | no session in the directory is working this run | watcher error, exit `2`, as before |
 | the floor refused every candidate | the builder's session is not visible from here | **liveness unknown** — a degraded mode, not an error |
+| two or more cleared the floor | more than one session could be the builder | watcher error, exit `2`, both named |
 
 In the second state the banner prints `liveness: unknown (no transcript newer
 than base)` in place of the timestamp and age, the evidence block names the
@@ -341,7 +392,10 @@ is excluded from a run-2 watch by name, whatever its mtime. `selftest.sh`
 asserts the exact case, from both directions and under either pin.
 
 `status_check.sh` prints the candidate list, the rejected files with the reason
-each was rejected, and whether the choice was `derived` or `pin (no candidate)`.
+each was rejected, and whether the choice was `derived`, `derived by floor, not
+by run number` or `pin (no candidate)`. A file the floor *chose* is dropped
+from the rejected list, because "refused for naming no run 5" is no longer a
+true thing to say about the file on the line above it.
 
 ## Where the batch rows come from
 
@@ -631,7 +685,7 @@ commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to overrid
 
 ## Verified
 
-`./selftest.sh` — 267 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 290 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
@@ -670,7 +724,12 @@ whole script, which prints canned JSON and never opens a socket; its default
 is the unavailable branch, so a case that forgets to say what CI said gets the
 unverified answer rather than a call to the real `gh`.
 
-It covers the **base-time floor** against the 2026-10-01 shapes: the September
+It covers the floor read **forwards** — one post-base transcript derived with
+its warrant named in the banner and the report, an aux one and a plan-silent
+one and the watcher's own kept out of the pool, a pin and a run-naming prompt
+both outranking it, two candidates left as exit `2` with both named, and an
+unreadable base leaving the fallback unavailable rather than permissive. It
+covers the **base-time floor** against the 2026-10-01 shapes: the September
 run-3 prompt is shown to be a perfectly good run-3 builder prompt and the
 transcript is still refused, with the rejection naming both timestamps; the same
 transcript is **accepted** once the base's author time is moved behind it, so it

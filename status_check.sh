@@ -47,7 +47,8 @@ python3 - <<'PY'
 import os, sys, time
 
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
-from watch_lib import (ARM_CMD_PREFIX, HOW_FLOOR, age, asks_question,
+from watch_lib import (ARM_CMD_PREFIX, HOW_AMBIGUOUS, HOW_FLOOR,
+                       HOW_FLOOR_DERIVED, age, asks_question,
                        ci_conclusion, claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
@@ -208,8 +209,19 @@ if tname is None:
         print("  Every candidate was refused by the base-time floor - no transcript")
         print("  in this directory was written after base %s. Liveness is unknown" % BASE)
         print("  for this base. Pass SPANWEAVE_PINNED=<uuid>.jsonl to override.")
-        for name, why in rejected:
-            print("  refused: %s  %s" % (name, why))
+    elif how == HOW_AMBIGUOUS:
+        # The opposite failure from the floor's: not "nothing matched" but "too
+        # much did". No prompt names this run, and more than one transcript is
+        # about the plan and was written since the base, so the floor cannot
+        # derive one either - and picking the newest of them would be a guess
+        # dressed as a derivation. Both are named; the operator pins one.
+        print("  No prompt names run %d, and %d transcripts are about WORKPLAN.md,"
+              % (RUN, len(cands)))
+        print("  are not aux prompts and were written since base %s, so the" % BASE)
+        print("  floor cannot pick between them either. Pass")
+        print("  SPANWEAVE_PINNED=<uuid>.jsonl to name one.")
+    for name, why in rejected:
+        print("  refused: %s  %s" % (name, why))
     sys.exit(2)
 tpath = os.path.join(TDIR, tname)
 sub   = subagents_dir(TDIR, tname)
@@ -223,6 +235,14 @@ entries = tail_entries(tpath, 60)
 pending = pending_agents(entries)
 
 print("chosen     : %s  [%s]" % (tname, how))
+if how == HOW_FLOOR_DERIVED:
+    # The warrant, said out loud wherever the choice is shown: no prompt named
+    # this run, and this is the only session about the plan written since the
+    # base commit. Weaker evidence than a prompt that names the run, and the
+    # reader is told which it got.
+    print("note       : %s - no prompt named run %d, and this is the only"
+          % (HOW_FLOOR_DERIVED, RUN))
+    print("             transcript about WORKPLAN.md written since base %s" % BASE)
 # Only an operator-given pin is worth a line.  There is no default pin: a
 # constant naming one run's session made every later run report `<-- FOLLOWED
 # off the pin`, which reads as drift when it is the derivation working.

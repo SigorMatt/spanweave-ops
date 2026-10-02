@@ -20,7 +20,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 267 cases over throwaway fixtures. Proves both rules, the derived branch and PID defaults, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
+| `selftest.sh` | 290 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch and PID defaults, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
 
 ## What you have to pass, and what you do not
 
@@ -31,7 +31,7 @@ Three things are **derived**, so the only flags a normal invocation needs are
 |---|---|---|
 | the branch | `git symbolic-ref --short HEAD` in `~/git/spanweave`, read **once at arming** | you want to watch a branch the repo is not on — which is also what arms the wrong-branch tripwire |
 | the builder PID set | the `claude --dangerous…` processes alive **at arming**, via `pgrep` | you know which processes are the builder's and the derived set is wrong |
-| the builder transcript | the derivation rule in `WATCH.md` — prompt, run number, not-an-aux-session, **and last written no earlier than the base commit** | the derivation cannot see your session; then `SPANWEAVE_PINNED=<uuid>.jsonl` |
+| the builder transcript | the derivation rule in `WATCH.md` — prompt, run number, not-an-aux-session, **and last written no earlier than the base commit**; failing the run number, the one post-base non-aux transcript about the plan, if there is exactly one | the derivation cannot see your session, or two post-base sessions could be it; then `SPANWEAVE_PINNED=<uuid>.jsonl` |
 
 None of the three is a constant any more, and that is the point: each one named
 a *session*, so each was stale by the run after the one it was written for. See
@@ -114,6 +114,27 @@ reported as a near miss with both timestamps rather than quietly dropped. If the
 floor leaves nothing and no pin was given, the watch does not error: liveness is
 **unknown**, every banner says so, and `WATCH.md` has what that does to the stall
 rule.
+
+**And the same floor, read forwards.** On 2026-10-02 run 5 had landed L23,
+pushed it, and was mid-L24 with a sub-agent live — and *no* transcript named
+run 5: the builder was the session told to apply the **run-4** review
+decisions, which made the base commit itself and rolled straight into run 5
+without a new prompt, its `lastPrompt` naming run 4 inside the 200-character
+cut. Both entry points said "no builder transcript found for run 5" and exited
+`2`, about a live builder that was the only session written since the base.
+
+So when no prompt names run `N`, the floor is asked the other question. Among
+the transcripts that are about `WORKPLAN.md`, are not aux prompts, are not this
+session's own, and were written **since** the base commit, **exactly one is an
+answer**: it is derived, and every banner and the report say
+`derived by floor, not by run number` rather than letting it pass for a
+prompt-derived choice. **Two or more is not an answer** — the floor cannot pick
+between two sessions that both started after the base, so that stays a watcher
+error, exit `2`, with both files named so you can pin one. A base the repo
+cannot resolve gives no floor at all, so the fallback is simply unavailable:
+"clears the floor" must not degrade into "exists". The fallback drops the run
+number and *only* the run number — the aux test, the self test and the floor
+all still stand.
 
 Self-test:
 
@@ -266,7 +287,7 @@ answer it used on a `ci :` line.
 | `10` | **finished** — origin moved past base, HEAD matches it, no batch still open, and CI on the tip concluded success. Also the code for **finished (series closed)**, which is that end state reached by *deleting* the plan, and for the **(CI unverified)** form of either, where all of it holds but `gh` could not be read |
 | `15` | **finished: CI red on `<sha>`** — the push landed and every batch stopped, but CI on the pushed tip concluded something other than success |
 | `13` | **builder gone** — a PID from the arming set disappeared while the run is incomplete. An **empty** arming set cannot shrink, so the trigger has no signal; every poll banner says `no PID set: 'builder gone' disarmed` rather than looking quiet |
-| `2` | watcher error (no transcript in the directory was ever a candidate for this run, `WORKPLAN.md` unreadable, unhandled exception) or bad usage. A directory whose candidates were all refused by the **base-time floor** is *not* this: the watch keeps polling with liveness unknown |
+| `2` | watcher error (no transcript in the directory was ever a candidate for this run, **two or more cleared the base-time floor so none could be derived** — both are named — `WORKPLAN.md` unreadable, unhandled exception) or bad usage. A directory whose candidates were all refused by the **base-time floor** is *not* this: the watch keeps polling with liveness unknown |
 
 `status_check.sh` exits `0` when it printed a report, `2` on the same watcher
 errors — and a one-shot report has nothing to poll, so it exits `2` where the

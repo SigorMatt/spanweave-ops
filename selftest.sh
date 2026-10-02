@@ -1108,28 +1108,259 @@ touch -d '2026-09-20 00:00:00' "$TD7B/dddddddd/subagents/a.jsonl" "$TD7B/ddddddd
 check "with the subagents/ dir old too, the same transcript is refused" \
       "$(deriveF "$TD7B" "$BASE7" 3)" "None|none (older than base)"
 
-# (5) the real builder's own rejection is the truncated prompt, not the floor -
-#     its last write is newer than the base, and it is still not a candidate.
+# (5) the real builder's prompt does not name run 3 - the run number lay beyond
+#     the 200-char cap - but its last write is newer than the base, and it is
+#     the only such transcript here. The floor, read forwards, derives it.
 TD7C="$TMP/tdir7c"; mkT "$TD7C" 1d41a6d1 "$LP1D4"
 touch -d '2026-10-01 15:49:31' "$TD7C/1d41a6d1.jsonl"
-check "the real builder's truncated lastPrompt refuses it, and the floor does not" \
-      "$(deriveF "$TD7C" "$BASE7" 3)" "None|none"
-grep -q 'rejected 1d41a6d1.jsonl .*names no operative run 3 (names run 2).*truncated at the stored cap' \
-     "$TMP/derF.txt" \
-  && ok "the rejection names the truncation and the run it does name" \
-  || bad "the rejection does not name the truncation"
+check "the real builder, named by no prompt, is derived by the floor instead" \
+      "$(deriveF "$TD7C" "$BASE7" 3)" "1d41a6d1.jsonl|derived by floor, not by run number"
+grep -q 'rejected 1d41a6d1.jsonl' "$TMP/derF.txt" \
+  && bad "the chosen transcript is also listed as refused" \
+  || ok "the chosen transcript is no longer listed as refused"
 
-# (6) with both present the two rejections are distinguishable, which is the
-#     whole evidence of the 2026-10-01 drift in one list.
+# (6) both present: the September session is refused by the floor and the real
+#     builder is derived by it. That is the whole 2026-10-01 drift in one list,
+#     ending in the right file rather than in exit 2.
 TD7D="$TMP/tdir7d"; mkT "$TD7D" 351ac45a "$LP351"; mkT "$TD7D" 1d41a6d1 "$LP1D4"
 touch -d '2026-09-11 00:37:31' "$TD7D/351ac45a.jsonl"
 touch -d '2026-10-01 15:49:31' "$TD7D/1d41a6d1.jsonl"
-check "neither transcript is chosen, and the floor is the reported reason" \
-      "$(deriveF "$TD7D" "$BASE7" 3)" "None|none (older than base)"
-check "the two rejections are distinguishable in the rejected list" \
-      "$(grep -c -e 'rejected 351ac45a.jsonl .*predates the base' \
-                 -e 'rejected 1d41a6d1.jsonl .*truncated at the stored cap' "$TMP/derF.txt")" \
+check "the September session loses to the real builder, by date not by prompt" \
+      "$(deriveF "$TD7D" "$BASE7" 3)" "1d41a6d1.jsonl|derived by floor, not by run number"
+grep -q 'rejected 351ac45a.jsonl .*predates the base' "$TMP/derF.txt" \
+  && ok "the September session is still refused, and still says why" \
+  || bad "the September session's floor rejection is gone from the list"
+
+# ---------------------------------------------------------------------------
+echo
+echo "the floor read forwards - exactly one post-base transcript is an answer"
+# ---------------------------------------------------------------------------
+# 2026-10-02, run 5 of the live-graphs series: L23 landed and was pushed, L24
+# was in flight with a sub-agent live, and no transcript in the directory named
+# run 5. The builder was the session told to apply the *run-4* review
+# decisions - it made the base commit itself and rolled straight on into run 5
+# without a new prompt - so its stored lastPrompt names run 4, cut at the
+# 200-char cap. Both entry points said "no builder transcript found for run 5"
+# and exited 2, about a run whose builder was alive and was the only session in
+# the directory written since the base.
+#
+# So the floor is read forwards as well as backwards: a run number is a fact
+# about *some* run, while "written since this run's base commit" is a fact
+# about this one. Exactly one such transcript is an answer; two are not.
+R9="$TMP/repo9"; mkdir -p "$R9"
+git -C "$R9" init -q -b live-graphs
+git -C "$R9" config user.email t@example.invalid
+git -C "$R9" config user.name Selftest
+cat > "$R9/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| L23 | thing | done (`aaaaaaa`) | 20 |
+| L24 | thing | todo | 15 |
+
+## 4. Resume note
+
+- L23 done.
+
+---
+MD
+git -C "$R9" add -A
+GIT_COMMITTER_DATE='2026-10-02 12:30:20' GIT_AUTHOR_DATE='2026-10-02 12:30:20' \
+  git -C "$R9" commit -qm "plan: run-4 review decided, run 5 closes the series"
+BASE9="$(git -C "$R9" rev-parse HEAD)"
+git init -q --bare "$TMP/remote9.git"
+git -C "$R9" remote add origin "$TMP/remote9.git"
+git -C "$R9" push -q origin live-graphs
+
+# The real shape: a prompt that is about the plan, is not an aux prompt, names
+# run 4 operatively and is cut at the cap, so no later "run 5" was stored.
+LPRUN4='In ~/git/spanweave on live-graphs (tip e2df391), read WORKPLAN.md §0 in full. Apply patches/decisions-live-2026-10-02.md exactly as its header says: one plan-only sub-agent, one commit plan: run-4 rev…'
+
+der9() {  # der9 <tdir> <run> [pin] -> "<name>|<how>"; rejected rows to $TMP/der9.txt
+  SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$1" SPANWEAVE_BASE="$BASE9" SPANWEAVE_RUN="$2" \
+  SPANWEAVE_PINNED="${3:-}" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" python3 - <<'PY' > "$TMP/der9.txt"
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, derive_transcript
+name, lp, cands, how, rej = derive_transcript(config())
+print("%s|%s" % (name, how))
+for n, w in rej:
+    print("rejected %s  %s" % (n, w))
+PY
+  head -1 "$TMP/der9.txt"
+}
+
+# (1) exactly one post-base, plan-shaped, non-aux transcript: derive it, and
+#     say which rule chose it.
+TD9="$TMP/tdir9"; mkT "$TD9" 7c13afaf "$LPRUN4"
+touch -d '2026-10-02 12:44:04' "$TD9/7c13afaf.jsonl"
+check "no prompt names run 5, so the only post-base transcript is derived" \
+      "$(der9 "$TD9" 5)" "7c13afaf.jsonl|derived by floor, not by run number"
+printf '%s\n' "$(der9 "$TD9" 5)" | grep -q '^7c13afaf.jsonl|derived' \
+  && ok "the how it reports still begins with 'derived'" \
+  || bad "the how it reports does not begin with 'derived'"
+
+# (2) a session that predates the base is not in the pool at all: the floor
+#     still refuses it backwards, which is what makes one answer *one*.
+mkT "$TD9" 351ac45a "$LP351"
+touch -d '2026-09-11 00:37:31' "$TD9/351ac45a.jsonl"
+check "a pre-base session does not join the pool and does not make it ambiguous" \
+      "$(der9 "$TD9" 5)" "7c13afaf.jsonl|derived by floor, not by run number"
+
+# (3) an aux prompt is never in the pool, however recent. This is the guard
+#     that keeps a reviewer or a watcher out: the pool drops the run-number
+#     test, so the aux test is the only thing left standing between the
+#     derivation and a session that was told to *report* on the run.
+mkT "$TD9" 29d210c7 "Review WORKPLAN.md run 5 commits since the base, report only"
+touch -d '2026-10-02 12:45:00' "$TD9/29d210c7.jsonl"
+check "an aux prompt newer than the base is still not in the pool" \
+      "$(der9 "$TD9" 5)" "7c13afaf.jsonl|derived by floor, not by run number"
+
+# (4) a transcript that says nothing about the plan is not in the pool either.
+mkT "$TD9" eeeeeeee "Fix the flaky test in tests/test_ids.py and push"
+touch -d '2026-10-02 12:46:00' "$TD9/eeeeeeee.jsonl"
+check "a post-base transcript that is not about the plan is not in the pool" \
+      "$(der9 "$TD9" 5)" "7c13afaf.jsonl|derived by floor, not by run number"
+
+# (5) the watcher's own session is excluded from the pool as it is from the
+#     candidates - it is about the plan, it is newer than the base, and it is
+#     not the builder.
+TD9S="$TMP/tdir9s"; mkT "$TD9S" 7c13afaf "$LPRUN4"
+mkT "$TD9S" a5a21da0 "First, in ~/spanweave-ops at its tip, one commit with selftests, push: a run whose last batch deletes WORKPLAN.md ends with no rows to read — when WORKPLAN.md was present at --base…"
+touch -d '2026-10-02 12:44:04' "$TD9S/7c13afaf.jsonl"
+touch -d '2026-10-02 12:47:00' "$TD9S/a5a21da0.jsonl"
+check "this watcher's own post-base session is not in the pool" \
+      "$(SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9S" SPANWEAVE_BASE="$BASE9" \
+         SPANWEAVE_RUN=5 SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+         CLAUDE_CODE_SESSION_ID="a5a21da0" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, derive_transcript
+name, lp, cands, how, rej = derive_transcript(config())
+print("%s|%s" % (name, how))')" \
+      "7c13afaf.jsonl|derived by floor, not by run number"
+
+# (6) two of them is not an answer. Both are named, because the fix is for the
+#     operator to pin one - and guessing the newest would be the 2026-10-01
+#     drift with a new cause.
+TD9B="$TMP/tdir9b"; mkT "$TD9B" 7c13afaf "$LPRUN4"
+mkT "$TD9B" fdd33f45 'In ~/git/spanweave on live-graphs (tip 3ab6638), read WORKPLAN.md §0 in full. Apply patches/decisions-live-2026-10-03.md exactly as its header says: one plan-only sub-agent, one commit plan: run-6 rev…'
+touch -d '2026-10-02 12:44:04' "$TD9B/7c13afaf.jsonl"
+touch -d '2026-10-02 12:45:04' "$TD9B/fdd33f45.jsonl"
+check "two post-base candidates are not an answer: nothing is derived" \
+      "$(der9 "$TD9B" 5)" "None|none (two or more clear the floor)"
+check "both are listed, by name" \
+      "$(grep -c -e 'rejected 7c13afaf.jsonl .*floor cannot pick between them' \
+                 -e 'rejected fdd33f45.jsonl .*floor cannot pick between them' "$TMP/der9.txt")" \
       "2"
+grep -q 'SPANWEAVE_PINNED=<uuid>.jsonl' "$TMP/der9.txt" \
+  && ok "the ambiguity says how to resolve it" \
+  || bad "the ambiguity does not say how to resolve it"
+
+# (7) an operator pin still outranks the floor - it outranks the run number
+#     already, and an operator who names a file has said something the
+#     watcher's evidence cannot outvote.
+check "a pin outranks the ambiguity" \
+      "$(der9 "$TD9B" 5 fdd33f45.jsonl)" "fdd33f45.jsonl|pin (no candidate)"
+check "a pin outranks a floor derivation too" \
+      "$(der9 "$TD9" 5 351ac45a.jsonl)" "351ac45a.jsonl|pin (no candidate)"
+
+# (8) a prompt that DOES name the run still wins, and the near-miss keeps its
+#     own rejection: the fallback is a fallback, not a replacement.
+TD9C="$TMP/tdir9c"; mkT "$TD9C" 7c13afaf "$LPRUN4"
+mkT "$TD9C" cccccccc "Resume WORKPLAN.md run 5"
+touch -d '2026-10-02 12:44:04' "$TD9C/7c13afaf.jsonl"
+touch -d '2026-10-02 12:40:00' "$TD9C/cccccccc.jsonl"
+check "a prompt that names the run beats the newer post-base one" \
+      "$(der9 "$TD9C" 5)" "cccccccc.jsonl|derived"
+grep -q 'rejected 7c13afaf.jsonl .*names no operative run 5 (names run 4).*truncated at the stored cap' \
+     "$TMP/der9.txt" \
+  && ok "the near miss still names the truncation and the run it does name" \
+  || bad "the near miss lost its truncation rejection"
+
+# (9) with no readable base author time the floor has said nothing, so the
+#     fallback is unavailable: "clears the floor" would mean "exists".
+check "an unreadable base leaves the fallback unavailable, not permissive" \
+      "$(SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9" SPANWEAVE_BASE="deadbeef" \
+         SPANWEAVE_RUN=5 SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+         CLAUDE_CODE_SESSION_ID="" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, derive_transcript
+name, lp, cands, how, rej = derive_transcript(config())
+print("%s|%s" % (name, how))')" \
+      "None|none"
+
+# (10) the verdict reads a floor derivation as a visible builder. It is a
+#      weaker warrant for *which file*, not weaker evidence that a session is
+#      there - and reading it as "no transcript" would report a live builder
+#      mid-batch as `not started`.
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import HOW_FLOOR_DERIVED, verdict
+B = ["L23", "L24"]
+bad = 0
+cases = [
+    ("a live floor-derived builder with no plan commit is applying plan",
+     verdict({b: "todo" for b in B}, "worktree", B, HOW_FLOOR_DERIVED, 60, False,
+             False, False, [], head_past_base=False)[0], "applying plan"),
+    ("a quiet floor-derived builder that declared nothing is unclear, not 'not started'",
+     verdict({b: "todo" for b in B}, "worktree", B, HOW_FLOOR_DERIVED, 3600, True,
+             False, False, [])[0], "unclear"),
+]
+for name, got, want in cases:
+    if got == want: print("  PASS  %s" % name)
+    else: print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# (11) end to end in both entry points: the banner says which rule chose the
+#      file, the report says it in the transcript section, and the ambiguity is
+#      a watcher error in both - with both files named.
+TD9="$TD9" ; ST9="$TMP/state9"; mkdir -p "$ST9"
+out="$(SPANWEAVE_STATE_DIR="$ST9" SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9" \
+       SPANWEAVE_BASE="$BASE9" SPANWEAVE_BRANCH=live-graphs \
+       SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L23 L24" \
+       "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+printf '%s\n' "$out" | grep -q "^poll .*<-- derived by floor, not by run number" \
+  && ok "the poll banner says it was derived by floor, not by run number" \
+  || bad "the poll banner does not say how the transcript was derived"
+
+sout="$(SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9" SPANWEAVE_BASE="$BASE9" \
+        SPANWEAVE_BRANCH=live-graphs SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+        SPANWEAVE_PIDS="" \
+        "$OPS_DIR/status_check.sh" --run 5 --batches "L23 L24" 2>&1)"
+printf '%s\n' "$sout" | grep -q "chosen     : 7c13afaf.jsonl  \[derived by floor, not by run number\]" \
+  && ok "the report names the rule that chose the transcript" \
+  || bad "the report does not name the rule that chose the transcript"
+printf '%s\n' "$sout" | grep -q "no prompt named run 5" \
+  && ok "the report says why the floor had to choose" \
+  || bad "the report does not say why the floor had to choose"
+
+rm -rf "$ST9"; mkdir -p "$ST9"
+out="$(SPANWEAVE_STATE_DIR="$ST9" SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9B" \
+       SPANWEAVE_BASE="$BASE9" SPANWEAVE_BRANCH=live-graphs \
+       SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+       SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="L23 L24" \
+       "$OPS_DIR/watch_run.sh" --once --run 5 2>&1)"
+check "two post-base candidates are a watcher error in the watch (exit 2)" "$?" "2"
+printf '%s\n' "$out" | grep -q "7c13afaf.jsonl" && printf '%s\n' "$out" | grep -q "fdd33f45.jsonl" \
+  && ok "the watcher error names both transcripts" \
+  || bad "the watcher error does not name both transcripts"
+
+SPANWEAVE_REPO="$R9" SPANWEAVE_TDIR="$TD9B" SPANWEAVE_BASE="$BASE9" \
+SPANWEAVE_BRANCH=live-graphs SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+SPANWEAVE_PIDS="" "$OPS_DIR/status_check.sh" --run 5 --batches "L23 L24" \
+  > "$TMP/sc9b.txt" 2>&1
+check "two post-base candidates are a watcher error in the report (exit 2)" "$?" "2"
+grep -c -e '7c13afaf.jsonl' -e 'fdd33f45.jsonl' "$TMP/sc9b.txt" >/dev/null \
+  && grep -q 'floor cannot pick between them' "$TMP/sc9b.txt" \
+  && ok "the report names both and says how to resolve it" \
+  || bad "the report does not name both candidates"
 
 # ---------------------------------------------------------------------------
 echo
