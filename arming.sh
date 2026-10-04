@@ -2,6 +2,9 @@
 # ARMED rather than re-read on every poll.  Sourced by all four entry points;
 # it is not executable on its own.  Requires SPANWEAVE_OPS_DIR.
 #
+# Both facts are read FROM THE WATCHED REPO, so `--repo` has to be in hand
+# before arming runs - see `spanweave_export_repo`.
+#
 # Both were hard-coded constants until 2026-09-30, and a constant about a
 # *session* is stale by the next run:
 #
@@ -41,14 +44,34 @@
 spanweave_export_base() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --base) [ -n "${2:-}" ] && export SPANWEAVE_BASE="$2"; shift 2 ;;
+      # `shift 2` past the end fails and shifts nothing, which spins this
+      # loop forever, so a flag given without a value is shifted one at a time.
+      --base) [ -n "${2:-}" ] && export SPANWEAVE_BASE="$2"
+              shift; [ $# -gt 0 ] && shift ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# `--repo` is pulled out of argv for the same reason, and more urgently: both
+# of arming's values are read from the watched repo, and the transcript
+# directory is derived from it too.  A `--repo` seen only later by
+# `watch_run.sh` would leave a watch armed on the DEFAULT repo's branch and the
+# default repo's builder processes while every poll reported on the given one -
+# a report that is wrong in exactly the way this file exists to prevent.
+# `watch_run.sh` and `status_check.sh` parse `--repo` themselves before arming.
+spanweave_export_repo() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) [ -n "${2:-}" ] && export SPANWEAVE_REPO="$2"
+              shift; [ $# -gt 0 ] && shift ;;
       *) shift ;;
     esac
   done
 }
 
 spanweave_arm() {
-  local need_branch=0 need_pids=0 out
+  local need_branch=0 need_pids=0 out scope_note
   [ -z "${SPANWEAVE_BRANCH:-}" ] && need_branch=1
   [ -z "${SPANWEAVE_PIDS+x}" ]   && need_pids=1
   if [ "$need_branch" -eq 0 ] && [ "$need_pids" -eq 0 ]; then
@@ -63,8 +86,19 @@ import os, sys
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 import watch_lib
 
-print(watch_lib.default_branch(watch_lib.repo_dir()))
-print(" ".join(str(p) for p in watch_lib.arming_pids()))
+repo = watch_lib.repo_dir()
+armed, outside = watch_lib.pids_in_repo(repo=repo)
+print(watch_lib.default_branch(repo))
+print(" ".join(str(p) for p in armed))
+# Line 3: the scope's rejections, so an empty armed set is never confused with
+# "no builder is running".  Said once, at arming, because that is when the set
+# is fixed - and because the usual cause is a second series under way in
+# another repo, which an operator who sees the PIDs can recognise at a glance.
+if outside:
+    print("arming: %d builder-shaped claude process(es) are running outside %s"
+          " and are not armed on (%s); 'builder gone' watches only the %d"
+          " inside it."
+          % (len(outside), repo, " ".join(str(p) for p in outside), len(armed)))
 PY
 )" || out=""
 
@@ -84,6 +118,10 @@ PY
   if [ "$need_pids" -eq 1 ]; then
     SPANWEAVE_PIDS="$(printf '%s\n' "$out" | sed -n 2p)"
     export SPANWEAVE_PIDS
+    # Only when this arming actually derived the set: a note about PIDs we did
+    # not arm on makes no sense beside an operator's own `--pids`.
+    scope_note="$(printf '%s\n' "$out" | sed -n 3p)"
+    [ -n "$scope_note" ] && printf '%s\n' "$scope_note"
   fi
   spanweave_liveness_note
 }

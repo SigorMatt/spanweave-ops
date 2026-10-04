@@ -5,18 +5,22 @@
 # terminal.  Exits with watch_run.sh's exit code.  See WATCH.md.
 #
 # usage: watch_loop.sh [--run N] [--batches "A5 A6 ..."] [--base SHA]
-#                      [--branch NAME] [--pids "P P P"]
+#                      [--branch NAME] [--pids "P P P"] [--repo DIR]
 #
-# --branch defaults to the repo's own checkout and --pids to the
-# `claude --dangerous...` processes alive now, both resolved ONCE before the
-# loop and exported - see arming.sh, and watch_monitor.sh for the same note.
+# --repo is the watched repo (default ~/git/spanweave); --branch defaults to
+# its checkout and --pids to the `claude --dangerous...` processes whose
+# working directory is inside it, both resolved ONCE before the loop and
+# exported - see arming.sh, and watch_monitor.sh for the same note.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SPANWEAVE_OPS_DIR="$HERE"
 
 . "$HERE/arming.sh"
-# The base out of argv, so arming's liveness note is about the base this watch
-# is actually armed on: arming runs before `watch_run.sh` ever sees these flags.
+# The repo out of argv, because arming reads the branch and the PID set FROM
+# the watched repo, and the base out of argv, so arming's liveness note is
+# about the base this watch is actually armed on: arming runs before
+# `watch_run.sh` ever sees these flags.
+spanweave_export_repo "$@"
 spanweave_export_base "$@"
 spanweave_arm
 

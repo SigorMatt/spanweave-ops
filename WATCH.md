@@ -40,7 +40,8 @@ reason `.git/index` is stat'd *before* any git command runs in a poll.
 ```
 
 Flags on all four: `--run N`, `--batches "<list>"`, `--base SHA`,
-`--branch NAME`, `--pids "P P P"`; `watch_run.sh` also takes `--once`.
+`--branch NAME`, `--pids "P P P"`, `--repo DIR`; `watch_run.sh` also takes
+`--once`.
 Environment overrides (all optional, flags set the same variables):
 `SPANWEAVE_REPO`, `SPANWEAVE_TDIR`, `SPANWEAVE_PINNED`, `SPANWEAVE_SELF`,
 `SPANWEAVE_BASE`, `SPANWEAVE_BRANCH`, `SPANWEAVE_RUN`, `SPANWEAVE_BATCHES`,
@@ -51,6 +52,20 @@ see a branch in the environment and report it as `given`.
 
 `--branch` and `--pids` are optional and normally omitted; see **Arming**
 below. `SPANWEAVE_PINNED` is empty by default — there is no pinned transcript.
+
+**The repo is a parameter, and three facts derive from it.** `--repo DIR`
+(default `~/git/spanweave`) is the watched repo, and the branch, the builder
+PID set and the **transcript directory** are all read from it: the branch is
+its checkout, the PID set is the `claude --dangerous…` processes whose working
+directory is inside it, and the transcript directory is Claude Code's project
+directory for that path — the absolute path with every non-alphanumeric
+character replaced by `-`, so `/home/msi/git/spanweave` is
+`~/.claude/projects/-home-msi-git-spanweave`. It was a constant naming that one
+project, which made a watch of any *second* repo report that repo's branch and
+commits beside the other project's transcript, liveness and sub-agent activity.
+`SPANWEAVE_TDIR` still outranks the derivation: the encoding is Claude Code's,
+not ours. The two looping front ends pull `--repo` out of their own argv before
+they arm (`spanweave_export_repo`), for the same reason they pull `--base`.
 
 Each poll prints a one-line banner naming the transcript it is watching, HEAD,
 `origin/<branch>`, the liveness timestamp and its age — or
@@ -70,7 +85,17 @@ then held fixed for the life of that watch. Both used to be constants in
 | | default | resolved by |
 |---|---|---|
 | branch | `git symbolic-ref --short HEAD` in the watched repo | `arming.sh` at start, exported |
-| PID set | the `claude --dangerous…` processes alive now | `arming.sh` at start, exported |
+| PID set | the `claude --dangerous…` processes whose cwd is inside the watched repo | `arming.sh` at start, exported |
+
+**The PID set is scoped to the repo.** Command shape alone stopped being
+enough once two series could be under way at once — on 2026-10-04 two were,
+`spanweave` and `spanweave-live`. An unscoped set arms each watch on the other
+watch's builder, so `builder gone` fires when a stranger finishes and stays
+silent when the builder this watch is about dies. A process whose cwd cannot be
+read is reported outside, never armed on: "we could not look" is not "it is
+ours". Arming prints one line naming the builder-shaped processes the scope
+refused, so an armed set that is empty is never confused with *no builder is
+running* — and `status_check.sh` says the same thing in its own words.
 
 `watch_monitor.sh` and `watch_loop.sh` re-invoke `watch_run.sh` every few
 minutes, so **they** arm, at their own start, and export both down; a
@@ -712,8 +737,11 @@ commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to overrid
 
 ## Verified
 
-`./selftest.sh` — 290 cases, fixtures only, `~/git/spanweave` and the real
-transcript directory never touched. It covers: the rule-(a) shapes including
+`./selftest.sh` — 339 cases, fixtures only, `~/git/spanweave` and the real
+transcript directory never touched — and, since 2026-10-04, the real `pgrep`
+not run either: arming now says which builder-shaped processes its repo scope
+refused, so a case that read the machine put this machine's live sessions into
+its own expected output. It covers: the rule-(a) shapes including
 the real `477fe9b` message and the `R`-prefixed and two-digit ids; the rule-(b)
 derivation from both run directions, both tiebreaks, the pin fallback, the aux
 and watcher prompts that must not be builders, and self-exclusion — including
@@ -785,7 +813,20 @@ Because the branch is derived, an unset `SPANWEAVE_BRANCH` would make
 `config()` shell out to the *real* repo. `selftest.sh` exports a fixture floor
 for `SPANWEAVE_REPO` and `SPANWEAVE_BRANCH` at the top so the promise in its
 header still holds; the branch cases unset them deliberately, against a fixture
-repo of their own.
+repo of their own. The floor now covers the transcript directory too, for free:
+it derives from `SPANWEAVE_REPO`, so a case that forgets `SPANWEAVE_TDIR` reads
+a directory under the fixture repo's name rather than the real one. `gh` and
+`pgrep` are stubbed on `PATH` for every case, so no case can reach the network
+or this machine's process table.
+
+The `--repo` cases name a *second* fixture repo while `SPANWEAVE_REPO` in the
+environment still names the first, so each one is about the flag outranking the
+environment and reaching arming — and none of them can fall back to the real
+repo even when the code under test is broken. The two looping front ends are
+driven end to end with a dead PID and an open batch, which makes `builder gone`
+fire on the first poll, and the case asserts the *armed branch* in the streamed
+evidence (`origin/other-series`) rather than only the exit code: the exit code
+alone passes even when `spanweave_export_repo` is deleted.
 
 The dedup fixtures pin their timestamps once rather than recomputing
 `touch -d '-20 min'` per call. Recomputing made the fixture lift its own

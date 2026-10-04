@@ -24,8 +24,8 @@ export SPANWEAVE_REPO="$TMP/no-such-repo" SPANWEAVE_BRANCH="selftest-floor"
 # GH_STUB_*.  Its default is the "gh could not tell us anything" branch, so a
 # case that forgets to say what CI said gets the unverified answer rather than
 # a silent network call.
-GHBIN="$TMP/ghbin"; mkdir -p "$GHBIN"
-cat > "$GHBIN/gh" <<'STUB'
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+cat > "$STUBBIN/gh" <<'STUB'
 #!/usr/bin/env bash
 # selftest stub for gh - prints canned JSON, never opens a socket.
 [ -n "${GH_STUB_SLEEP:-}" ] && sleep "$GH_STUB_SLEEP"
@@ -33,9 +33,25 @@ cat > "$GHBIN/gh" <<'STUB'
 [ -n "${GH_STUB_ERR:-}" ] && printf '%s\n' "$GH_STUB_ERR" >&2
 exit "${GH_STUB_RC:-1}"
 STUB
-chmod +x "$GHBIN/gh"
-export PATH="$GHBIN:$PATH"
+chmod +x "$STUBBIN/gh"
+# The same kind of floor for `pgrep`, which arming shells out to for the PID
+# set.  It answered from the real machine until 2026-10-04, which was harmless
+# only while the PID set was unscoped: now that the set is scoped to the
+# watched repo, arming prints a line naming the builder-shaped processes
+# running OUTSIDE it - so a real `pgrep` put this machine's own sessions into
+# the output a case was comparing, and `arming derives the branch` failed with
+# three live PIDs in its captured stdout.  A fixture-only harness cannot read
+# the machine at all.  Default: nothing is running, which is pgrep's exit 1.
+cat > "$STUBBIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+# selftest stub for pgrep - answers only from PGREP_STUB_OUT.
+[ -n "${PGREP_STUB_OUT:-}" ] || exit 1
+printf '%s\n' "$PGREP_STUB_OUT"
+STUB
+chmod +x "$STUBBIN/pgrep"
+export PATH="$STUBBIN:$PATH"
 export GH_STUB_RC=1 GH_STUB_OUT="" GH_STUB_ERR="stub gh: no canned answer for this case"
+export PGREP_STUB_OUT=""
 
 gh_says() {   # gh_says <repo> <status> <conclusion-as-json> - about that repo's HEAD
   export GH_STUB_RC=0 GH_STUB_ERR=""
@@ -697,7 +713,7 @@ grep -q "nothing here has verified CI" "$TMP/last_run.txt" \
 
 # Every way of failing to READ an answer, at the function, including the one
 # an end-to-end case cannot stage: gh not on PATH at all.
-python3 - "$R2" "$GHBIN" "$TMP" <<'PY'
+python3 - "$R2" "$STUBBIN" "$TMP" <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 from watch_lib import ci_conclusion
@@ -1885,6 +1901,302 @@ check "an empty PID set does not fire builder gone" "$(run6)" "0|"
 grep -q "no PID set: 'builder gone' disarmed" "$TMP/last_run6.txt" \
   && ok "the banner says the trigger is disarmed" \
   || bad "the banner does not say the trigger is disarmed"
+
+# ---------------------------------------------------------------------------
+echo
+echo "the watched repo is a parameter, and three defaults derive from it"
+# ---------------------------------------------------------------------------
+# `--repo` existed on `status_check.sh` only, and the transcript directory was
+# the constant `~/.claude/projects/-home-msi-git-spanweave`.  So a check
+# pointed at a second repo - and on 2026-10-04 there was one, `spanweave-live`
+# - read that repo's branch and that repo's commits while the transcript, the
+# liveness timestamp and the sub-agent activity all came from the OTHER
+# project's sessions, and the PID set was armed on whichever builder happened
+# to be running anywhere on the machine.  Three facts now derive from the repo
+# the operator named: the branch, the PID set and the transcript directory.
+python3 - <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import DEF_PROJECTS, config, default_tdir, pids_in_repo
+
+# The floor this script set at the top, to be put back after the cases below
+# move SPANWEAVE_REPO around: no later case may be left pointing anywhere real.
+FLOOR = os.environ.get("SPANWEAVE_REPO")
+bad = 0
+
+
+def c(name, got, want):
+    global bad
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r\n        want %r" % (name, got, want))
+        bad = 1
+
+
+# -- the transcript directory ------------------------------------------------
+# Claude Code names a project directory after the absolute path of the
+# directory the session started in, with every non-alphanumeric character
+# replaced by `-`.  The encoding is Claude Code's; these cases pin our reading
+# of it against the real names on this machine.
+c("the project directory is the repo path with every non-alnum as '-'",
+  default_tdir("/home/msi/git/spanweave", "/P"), "/P/-home-msi-git-spanweave")
+c("a second repo gets a second directory, which is the whole point",
+  default_tdir("/home/msi/git/spanweave-live", "/P"),
+  "/P/-home-msi-git-spanweave-live")
+c("dots and underscores are not alphanumeric either",
+  default_tdir("/home/msi/git/my_repo.v2", "/P"), "/P/-home-msi-git-my-repo-v2")
+c("a relative path is resolved before it is encoded",
+  default_tdir("."),
+  os.path.join(DEF_PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())))
+
+# -- and through config(), where the entry points read it --------------------
+for name, env, want in [
+    ("with no SPANWEAVE_TDIR the directory derives from the repo",
+     {"SPANWEAVE_REPO": "/tmp/r1"}, default_tdir("/tmp/r1")),
+    ("naming the repo names the transcripts too",
+     {"SPANWEAVE_REPO": "/tmp/r2"}, default_tdir("/tmp/r2")),
+    ("an operator's own SPANWEAVE_TDIR still outranks the derivation",
+     {"SPANWEAVE_REPO": "/tmp/r1", "SPANWEAVE_TDIR": "/tmp/elsewhere"},
+     "/tmp/elsewhere"),
+    # The encoding belongs to Claude Code, not to us, so an empty value must
+    # not be mistaken for "the operator chose the empty directory".
+    ("an empty SPANWEAVE_TDIR is not a directory, so it does not count as given",
+     {"SPANWEAVE_REPO": "/tmp/r1", "SPANWEAVE_TDIR": ""}, default_tdir("/tmp/r1")),
+]:
+    for k in ("SPANWEAVE_REPO", "SPANWEAVE_TDIR"):
+        os.environ.pop(k, None)
+    os.environ.update(env)
+    c(name, config()["tdir"], want)
+for k in ("SPANWEAVE_REPO", "SPANWEAVE_TDIR"):
+    os.environ.pop(k, None)
+if FLOOR is not None:
+    os.environ["SPANWEAVE_REPO"] = FLOOR
+
+# -- the PID set, now scoped to the repo -------------------------------------
+# Command shape alone stopped being enough the moment two series could be
+# under way at once: an unscoped set arms each watch on the other watch's
+# builder, so `builder gone` fires on a stranger finishing and stays silent
+# when the builder this watch is about dies.
+PGREP = "\n".join([
+    "101 claude --dangerously-skip-permissions",          # in the repo
+    "102 claude --dangerously-skip-permissions --resume x",  # in a subdirectory
+    "103 claude --dangerously-skip-permissions",          # the OTHER repo
+    "104 claude --dangerously-skip-permissions",          # cwd unreadable
+    "105 claude",                                         # not a builder at all
+])
+CWD = {101: "/w/spanweave", 102: "/w/spanweave/tests",
+       103: "/w/spanweave-live", 104: None, 105: "/w/spanweave"}
+c("a builder whose cwd is the repo, or inside it, is armed on",
+  pids_in_repo(PGREP, repo="/w/spanweave", cwd_of=CWD.get)[0], [101, 102])
+c("a builder in another repo is reported outside, never armed on",
+  103 in pids_in_repo(PGREP, repo="/w/spanweave", cwd_of=CWD.get)[1], True)
+# A sibling that merely shares the prefix is a different repo.  Without the
+# separator test `/w/spanweave-live` reads as "inside /w/spanweave" and the
+# scope lets through exactly the process it exists to exclude.
+c("a sibling repo sharing the path prefix is not inside it",
+  pids_in_repo(PGREP, repo="/w/spanweave", cwd_of=CWD.get),
+  ([101, 102], [103, 104]))
+# "We could not look" is not "it is ours".  Arming a terminal trigger on a
+# process we failed to identify is the guess this tooling does not make.
+c("a builder whose cwd cannot be read is outside, not armed on",
+  pids_in_repo(PGREP, repo="/w/spanweave", cwd_of=lambda p: None),
+  ([], [101, 102, 103, 104]))
+c("a non-builder process is neither armed on nor reported outside",
+  [p for grp in pids_in_repo(PGREP, repo="/w/spanweave", cwd_of=CWD.get)
+   for p in grp if p == 105], [])
+c("with no repo there is no scope, and every builder-shaped PID is armed on",
+  pids_in_repo(PGREP, cwd_of=CWD.get), ([101, 102, 103, 104], []))
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# A second fixture repo, on its own branch, with an R-prefixed batch list: the
+# `--repo` cases below name it while SPANWEAVE_REPO in the environment still
+# points at the first one, so every case is about the flag reaching arming -
+# and none of them can fall back to the real ~/git/spanweave.
+RA="$TMP/repoA"; mkdir -p "$RA"
+git -C "$RA" init -q -b other-series
+git -C "$RA" config user.email t@example.invalid
+git -C "$RA" config user.name Selftest
+cat > "$RA/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| ID | Batch | Status | Calls |
+|---|---|---|---|
+| R0 | skeleton | done (`696702f`) | 10 |
+| R1 | framing | done (`a4fec60`) | 10 |
+| R2 | routing | todo | 15 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$RA" add -A && git -C "$RA" commit -qm "plan: open the series"
+BASEA="$(git -C "$RA" rev-parse HEAD)"
+git init -q --bare "$TMP/remoteA.git"
+git -C "$RA" remote add origin "$TMP/remoteA.git"
+git -C "$RA" push -q origin other-series
+TDA="$TMP/tdirA"; mkdir -p "$TDA"; STA="$TMP/stateA"; mkdir -p "$STA"
+printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 2"}\n' > "$TDA/aaaaaaaa.jsonl"
+
+# `arming.sh` reads BOTH of its values from the watched repo, so `--repo` has
+# to reach it - and the two looping front ends arm before `watch_run.sh` ever
+# parses a flag.  Without `spanweave_export_repo` a `--repo` watch is armed on
+# the DEFAULT repo's branch and the default repo's processes while every poll
+# reports on the given one.
+armedrepo() {  # armedrepo <argv...> -> "<repo>|<branch>"
+  env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+      SPANWEAVE_REPO="$R6D" bash -c '
+    . "$SPANWEAVE_OPS_DIR/arming.sh"
+    spanweave_export_repo "$@"
+    spanweave_arm >/dev/null
+    printf "%s|%s" "$SPANWEAVE_REPO" "$SPANWEAVE_BRANCH"' bash "$@"
+}
+check "arming takes --repo out of argv and derives that repo's branch" \
+      "$(armedrepo --run 2 --repo "$RA" --batches "R2")" "$RA|other-series"
+check "no --repo in argv leaves the environment's repo alone" \
+      "$(armedrepo --run 2 --batches "R2")" "$R6D|live-graphs"
+check "an empty --repo is not a path, so it is not taken" \
+      "$(armedrepo --run 2 --repo "" )" "$R6D|live-graphs"
+
+# The scope's rejections are an EVENT, said once at arming: an armed set that
+# is empty because the builders are all in another repo must never read as
+# "no builder is running".
+scopenote() {  # scopenote <PGREP_STUB_OUT> -> arming's stdout
+  env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+      SPANWEAVE_REPO="$RA" PGREP_STUB_OUT="$1" bash -c '
+    . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm'
+}
+printf '%s\n' "$(scopenote "777001 claude --dangerously-skip-permissions")" \
+  > "$TMP/scopenote.txt"
+grep -q "are running outside $RA" "$TMP/scopenote.txt" \
+  && ok "arming says which builder-shaped processes the scope refused" \
+  || bad "arming is silent about a builder-shaped process outside the repo"
+grep -q "777001" "$TMP/scopenote.txt" \
+  && ok "the note names the PIDs, so an operator can recognise the other series" \
+  || bad "the note does not name the refused PIDs"
+check "nothing builder-shaped is running: no note, nothing to report" \
+      "$(scopenote "")" ""
+
+# End to end, on each entry point that takes the flag.
+sa_out="$(env -u SPANWEAVE_BRANCH -u SPANWEAVE_PIDS \
+          SPANWEAVE_REPO="$R6D" SPANWEAVE_TDIR="$TDA" SPANWEAVE_PINNED="" \
+          SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+          "$OPS_DIR/status_check.sh" --run 2 --batches "R2" --base "$BASEA" \
+          --repo "$RA" 2>&1)"
+check "status_check.sh --repo reports that repo's path" \
+      "$(printf '%s\n' "$sa_out" | sed -n 's/^path  *: //p')" "$RA"
+check "... and that repo's branch, derived" \
+      "$(printf '%s\n' "$sa_out" | sed -n 's/^branch  *: //p')" \
+      "other-series (watching other-series, derived)"
+
+wr_out="$(env -u SPANWEAVE_BRANCH \
+          SPANWEAVE_STATE_DIR="$STA" SPANWEAVE_REPO="$R6D" \
+          SPANWEAVE_TDIR="$TDA" SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+          CLAUDE_CODE_SESSION_ID="" SPANWEAVE_BASE="$BASEA" SPANWEAVE_PIDS="" \
+          SPANWEAVE_BATCHES="R2" SPANWEAVE_MEMO="" \
+          "$OPS_DIR/watch_run.sh" --once --run 2 --repo "$RA" 2>&1)"
+check "watch_run.sh --repo polls that repo clean" \
+      "$(printf '%s\n' "$wr_out" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)" ""
+printf '%s\n' "$wr_out" | grep -q "origin $(git -C "$RA" rev-parse --short origin/other-series)" \
+  && ok "its banner compares against the given repo's origin/other-series" \
+  || bad "its banner does not compare against the given repo's origin"
+
+# The two looping front ends arm and then re-invoke, so the flag has to survive
+# both.  One poll is enough: a dead PID in the set with a batch still open is
+# `builder gone`, which is terminal, so the loop exits instead of running on.
+mon_out="$(env -u SPANWEAVE_BRANCH \
+           SPANWEAVE_STATE_DIR="$STA" SPANWEAVE_REPO="$R6D" \
+           SPANWEAVE_TDIR="$TDA" SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+           CLAUDE_CODE_SESSION_ID="" SPANWEAVE_BATCHES="R2" SPANWEAVE_MEMO="" \
+           "$OPS_DIR/watch_monitor.sh" --run 2 --base "$BASEA" --repo "$RA" \
+           --pids 4000001 2>&1)"
+mon_rc=$?
+check "watch_monitor.sh --repo arms on the given repo and reaches its terminal trigger" \
+      "$mon_rc" "13"
+# The discriminating assertion, not merely "13": `builder gone` fires off the
+# PID set alone and would fire however the branch was armed.  What only a
+# `--repo` that reached ARMING can produce is an armed branch read from the
+# given repo - `origin/other-series` in the evidence, and no wrong-branch
+# tripwire ahead of it.  Dropping `spanweave_export_repo` from this script
+# arms on the environment's repo instead, and the block says `origin/live-graphs`
+# with a tripwire above it.
+printf '%s\n' "$mon_out" | grep -q "^origin/other-series:" \
+  && ok "the monitor armed the branch on the repo the flag named" \
+  || bad "the monitor's evidence names a branch from some other repo"
+printf '%s\n' "$mon_out" | grep -q "tripwire" \
+  && bad "the monitor tripped the wrong-branch wire, so arming missed --repo" \
+  || ok "no wrong-branch tripwire: the armed branch and the checkout agree"
+
+loop_out="$(env -u SPANWEAVE_BRANCH \
+            SPANWEAVE_STATE_DIR="$STA" SPANWEAVE_REPO="$R6D" \
+            SPANWEAVE_TDIR="$TDA" SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+            CLAUDE_CODE_SESSION_ID="" SPANWEAVE_BATCHES="R2" SPANWEAVE_MEMO="" \
+            "$OPS_DIR/watch_loop.sh" --run 2 --base "$BASEA" --repo "$RA" \
+            --pids 4000002 2>&1)"
+loop_rc=$?
+check "watch_loop.sh --repo does the same in a plain terminal" "$loop_rc" "13"
+printf '%s\n' "$loop_out" | grep -q "^origin/other-series:" \
+  && ok "the loop armed the branch on the repo the flag named" \
+  || bad "the loop's evidence names a branch from some other repo"
+
+# ---------------------------------------------------------------------------
+echo
+echo "a batch id is a capital letter and digits, whichever letter the plan uses"
+# ---------------------------------------------------------------------------
+# `[A-H]\d+` made every run-3 row and every run-3 declaration invisible: rows
+# read as "<row missing>", so "0/7 stopped, active: all seven" was a default
+# rather than an observation.  The pattern is `[A-Z]\d+` now; the receiver
+# series uses R0-R9, including a batch whose digit is ZERO, so these cases pin
+# that the generalisation actually covers the plan in use today.
+python3 - "$RA" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import BATCH_ID, declared_batches, workplan_statuses
+
+bad = 0
+
+
+def c(name, got, want):
+    global bad
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r\n        want %r" % (name, got, want))
+        bad = 1
+
+
+c("the pattern itself admits R and a digit", BATCH_ID, r"[A-Z]\d+")
+# The receiver series' own plan commits, verbatim.
+c("a plan: subject declares an R batch",
+  declared_batches("plan: R0 done, and the pins are HTTPS so CI can check out"
+                   " the submodule", ""), ["R0"])
+c("a zero is a digit: R0 is a batch id, not a near-miss",
+  declared_batches("plan: R0 done", ""), ["R0"])
+c("a body line declares an R batch",
+  declared_batches("routing: one spanweave.Builder per trace",
+                   "Batch R2 of WORKPLAN.md.  SPEC sections 4.1-4.7."), ["R2"])
+c("a second clause after the batch id does not hide it",
+  declared_batches("plan: R2 done, and its mutation criterion was wrong"
+                   " - the row is corrected", ""), ["R2"])
+# Still only where a batch is DECLARED: the R2 row cites R3 in prose, and a
+# citation is not a declaration whatever the prefix.
+c("an R batch cited in prose is still not a declaration",
+  declared_batches("plan: R2 done", "R3 does not depend on either thread."),
+  ["R2"])
+# And the rows: a table the watcher cannot read is reported as every batch
+# open, which is a default dressed as an observation.
+statuses, raw, source = workplan_statuses(sys.argv[1])
+c("an R-prefixed batch list is read, not reported missing",
+  (source, statuses),
+  ("worktree", {"R0": "done (`696702f`)", "R1": "done (`a4fec60`)",
+                "R2": "todo"}))
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
 
 # ---------------------------------------------------------------------------
 echo

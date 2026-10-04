@@ -19,13 +19,15 @@
 # evidence and the loop keeps going; watch_run.sh deduplicates them.  See WATCH.md.
 #
 # usage: watch_monitor.sh [--run N] [--batches "A5 A6 ..."] [--base SHA]
-#                         [--branch NAME] [--pids "P P P"]
+#                         [--branch NAME] [--pids "P P P"] [--repo DIR]
 #
-# --branch defaults to the repo's own checkout and --pids to the
-# `claude --dangerous...` processes alive now.  Both are resolved ONCE here,
-# before the loop, and exported to every `watch_run.sh` invocation: this script
-# re-invokes the watcher every few minutes, and re-deriving either per
-# invocation would quietly disarm the branch tripwire and `builder gone`.
+# --repo is the watched repo (default ~/git/spanweave); --branch defaults to
+# its checkout, --pids to the `claude --dangerous...` processes whose working
+# directory is inside it, and the transcript directory to Claude Code's project
+# directory for that path.  The first two are resolved ONCE here, before the
+# loop, and exported to every `watch_run.sh` invocation: this script re-invokes
+# the watcher every few minutes, and re-deriving either per invocation would
+# quietly disarm the branch tripwire and `builder gone`.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,8 +36,11 @@ STATE="${SPANWEAVE_STATE_DIR:-$HERE/state}"
 mkdir -p "$STATE"
 
 . "$HERE/arming.sh"
-# The base out of argv, so arming's liveness note is about the base this watch
-# is actually armed on: arming runs before `watch_run.sh` ever sees these flags.
+# The repo out of argv, because arming reads the branch and the PID set FROM
+# the watched repo, and the base out of argv, so arming's liveness note is
+# about the base this watch is actually armed on: arming runs before
+# `watch_run.sh` ever sees these flags.
+spanweave_export_repo "$@"
 spanweave_export_base "$@"
 spanweave_arm
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-6}"    # invocations (~9 min each) between heartbeats

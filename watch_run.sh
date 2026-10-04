@@ -20,11 +20,17 @@
 #
 # usage: watch_run.sh [--once] [--run N] [--batches "A5 A6 ..."] [--memo "F1"]
 #                     [--base SHA] [--branch NAME] [--pids "P P P"]
+#                     [--repo DIR]
 #
-# --branch defaults to the repo's own checkout (`git symbolic-ref --short
-# HEAD`) and --pids to the `claude --dangerous...` processes alive now.  Both
-# are resolved ONCE, here, and held for every poll of this invocation - see
-# arming.sh for why a per-poll reading would disarm two triggers.
+# --repo is the watched repo and defaults to ~/git/spanweave.  The branch, the
+# builder PID set and the transcript directory all DERIVE from it: the branch
+# is its checkout (`git symbolic-ref --short HEAD`), the PID set is the
+# `claude --dangerous...` processes whose working directory is inside it, and
+# the transcript directory is Claude Code's project directory for that path.
+# The first two are resolved ONCE, here, and held for every poll of this
+# invocation - see arming.sh for why a per-poll reading would disarm two
+# triggers.  --branch and --pids override the first two; SPANWEAVE_TDIR the
+# third.
 #
 # Exit codes: 0 nothing terminal (non-terminal events may have been printed)
 #             10 finished | 15 finished: CI red on the tip | 13 builder gone
@@ -51,8 +57,9 @@ while [ $# -gt 0 ]; do
     --base)    export SPANWEAVE_BASE="$2"; shift 2 ;;
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--memo \"F1\"] [--base SHA] [--branch NAME] [--pids \"P P P\"]" >&2; exit 2 ;;
+    --repo)    export SPANWEAVE_REPO="$2"; shift 2 ;;
+    -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "usage: $(basename "$0") [--once] [--run N] [--batches \"A5 A6 ...\"] [--memo \"F1\"] [--base SHA] [--branch NAME] [--pids \"P P P\"] [--repo DIR]" >&2; exit 2 ;;
   esac
 done
 

@@ -8,9 +8,11 @@
 # usage: status_check.sh --run N --batches "A5 A6 ..." [--base SHA]
 #                        [--branch NAME] [--pids "P P P"] [--repo DIR]
 #
-# --branch defaults to the repo's own checkout (`git symbolic-ref --short
-# HEAD`) and --pids to the `claude --dangerous...` processes alive right now;
-# neither is a constant any more.  See arming.sh.
+# --repo is the watched repo and defaults to ~/git/spanweave; --branch defaults
+# to its checkout (`git symbolic-ref --short HEAD`), --pids to the
+# `claude --dangerous...` processes whose working directory is inside it, and
+# the transcript directory to Claude Code's project directory for that path.
+# None of the four is a constant any more.  See arming.sh.
 #
 # Reads only.  Writes nothing anywhere - not to the repo, not to state/.
 # The one command that touches .git is `git fetch --quiet`, which updates the
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
     --branch)  export SPANWEAVE_BRANCH="$2"; shift 2 ;;
     --pids)    export SPANWEAVE_PIDS="$2"; shift 2 ;;
     --repo)    export SPANWEAVE_REPO="$2"; shift 2 ;;
-    -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "usage: $(basename "$0") --run N --batches \"A5 A6 ...\" [--base SHA] [--branch NAME] [--pids \"P P P\"] [--repo DIR]" >&2; exit 2 ;;
   esac
 done
@@ -52,7 +54,7 @@ from watch_lib import (ARM_CMD_PREFIX, HOW_AMBIGUOUS, HOW_FLOOR,
                        ci_conclusion, claude_processes,
                        config, declared_batches, derive_transcript, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
-                       newest_under, pending_agents, plan_at_rev,
+                       newest_under, pending_agents, pids_in_repo, plan_at_rev,
                        resume_note_tail, stamp,
                        subagents_dir, substantive, tail_entries, verdict,
                        workplan_statuses)
@@ -186,9 +188,23 @@ print("PID set at arming: %s" % (" ".join(str(p) for p in PIDSET) or "(empty)"))
 print("present now      : %s" % (" ".join(str(p) for p in PIDSET if p in running) or "(none)"))
 print("missing now      : %s" % (" ".join(str(p) for p in missing_pids) or "(none)"))
 if not PIDSET:
-    print("note             : no builder-shaped process (%r) is running, so this"
-          % ARM_CMD_PREFIX)
-    print("                   set is empty and `builder gone` has no signal.")
+    # Two different reasons for an empty set, and they are not the same news.
+    # The PID set is scoped to the watched repo (`pids_in_repo`), so a machine
+    # running a second series elsewhere has builder-shaped processes that this
+    # watch is deliberately not armed on - reporting that as "none is running"
+    # would be false about the machine while true about the watch.
+    _, outside = pids_in_repo(pgrep_out, repo=REPO)
+    if outside:
+        print("note             : %d builder-shaped process(es) (%r) are running,"
+              % (len(outside), ARM_CMD_PREFIX))
+        print("                   but none with a working directory inside %s" % REPO)
+        print("                   (%s), so this set is empty and `builder gone`"
+              % " ".join(str(p) for p in outside))
+        print("                   has no signal.")
+    else:
+        print("note             : no builder-shaped process (%r) is running, so this"
+              % ARM_CMD_PREFIX)
+        print("                   set is empty and `builder gone` has no signal.")
 print()
 print("pgrep -af claude (claude processes only):")
 shown = [l for l in pgrep_out.splitlines()

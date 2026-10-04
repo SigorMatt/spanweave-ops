@@ -18,7 +18,13 @@ import time
 # --------------------------------------------------------------------- config
 
 DEF_REPO   = os.path.expanduser("~/git/spanweave")
-DEF_TDIR   = os.path.expanduser("~/.claude/projects/-home-msi-git-spanweave")
+# The transcript directory is DERIVED from the watched repo - see
+# `default_tdir`.  It was a constant naming spanweave's project directory, and
+# a constant about one repo is wrong for every other: `--repo ~/git/spanweave-live`
+# would have been watched for its branch and its commits while the transcript,
+# the liveness timestamp and the sub-agent activity all came from a different
+# project's sessions, and nothing in the banner would have said so.
+DEF_PROJECTS = os.path.expanduser("~/.claude/projects")
 # No pin.  `DEF_PINNED` used to name run 2's builder transcript, and a constant
 # that names one session is a lie in every run after it: on 2026-09-30 a run-2
 # check reported `<-- FOLLOWED off the pin` while the derivation had already
@@ -70,6 +76,22 @@ def repo_dir():
     return os.environ.get("SPANWEAVE_REPO", DEF_REPO)
 
 
+def default_tdir(repo, projects=None):
+    """Claude Code's transcript directory for sessions started in `repo`.
+
+    Claude Code names a project directory after the absolute path of the
+    directory the session was started in, with every character that is not a
+    letter or a digit replaced by `-`; so `/home/msi/git/spanweave` becomes
+    `-home-msi-git-spanweave`.  Derived rather than configured, so that naming
+    the repo names the transcripts too: a watch pointed at one repo and reading
+    another repo's sessions would report a stranger's liveness as the builder's.
+
+    `SPANWEAVE_TDIR` still outranks this - the encoding is Claude Code's, not
+    ours, and an operator who knows better must be able to say so."""
+    enc = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(os.path.expanduser(repo)))
+    return os.path.join(projects or DEF_PROJECTS, enc)
+
+
 def default_branch(repo):
     """The branch `repo` has checked out right now, or "" if it has none.
 
@@ -94,20 +116,63 @@ def default_branch(repo):
 ARM_CMD_PREFIX = "claude --dangerous"
 
 
-def arming_pids(pgrep_out=None):
-    """The builder-shaped `claude` PIDs alive now, sorted.
+def pid_cwd(pid):
+    """The working directory of `pid`, or None if it cannot be read.
+
+    None is "we could not look" - the process exited between the `pgrep` and
+    this call, or it belongs to another user - and is deliberately not "" : the
+    scope below refuses an unreadable cwd rather than assuming either answer."""
+    try:
+        return os.path.realpath(os.readlink("/proc/%d/cwd" % pid))
+    except OSError:
+        return None
+
+
+def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd):
+    """-> (armed, outside): the builder-shaped `claude` PIDs whose working
+    directory is inside `repo`, and the builder-shaped ones that are not.
+
+    The command shape alone is not enough once the repo is a parameter.  Two
+    series can be under way on this machine at the same time - and on
+    2026-10-04 two were, `~/git/spanweave` and `~/git/spanweave-live` - so a
+    set armed on "every `claude --dangerous...` alive" would arm each watch on
+    the other watch's builder: `builder gone` would then fire on a stranger
+    finishing, and would stay silent when the builder this watch is about died
+    while the stranger lived.  A builder's cwd is the directory its session was
+    started in, which is the repo (or a path inside it).
+
+    With no `repo` there is no scope to apply and every builder-shaped PID is
+    armed on - that is the pre-repo behaviour, kept for a direct caller.  A PID
+    whose cwd cannot be read is reported as outside, never armed on: "not known
+    to be this repo's" is the honest reading, and the caller says so out loud
+    rather than quietly arming a trigger on a process it could not identify."""
+    out = claude_processes() if pgrep_out is None else pgrep_out
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(repo))) if repo else None
+    armed, outside = [], []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit() \
+                or not parts[1].startswith(ARM_CMD_PREFIX):
+            continue
+        pid = int(parts[0])
+        if root is None:
+            armed.append(pid)
+            continue
+        cwd = cwd_of(pid)
+        if cwd is not None and (cwd == root or cwd.startswith(root + os.sep)):
+            armed.append(pid)
+        else:
+            outside.append(pid)
+    return sorted(armed), sorted(outside)
+
+
+def arming_pids(pgrep_out=None, repo=None, cwd_of=pid_cwd):
+    """The builder-shaped `claude` PIDs of `repo` alive now, sorted.
 
     Resolved once when a watch is armed, never per poll: `builder gone` fires
     when this set *shrinks*, and a set re-derived each poll can never shrink.
     See `arming.sh`, which is the only thing that should call this."""
-    out = claude_processes() if pgrep_out is None else pgrep_out
-    pids = []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) == 2 and parts[0].isdigit() \
-                and parts[1].startswith(ARM_CMD_PREFIX):
-            pids.append(int(parts[0]))
-    return sorted(pids)
+    return pids_in_repo(pgrep_out, repo, cwd_of)[0]
 
 
 def config():
@@ -131,7 +196,10 @@ def config():
     pids_env = os.environ.get("SPANWEAVE_PIDS")
     return {
         "repo":    repo,
-        "tdir":    os.environ.get("SPANWEAVE_TDIR", DEF_TDIR),
+        # Derived from the repo unless an operator names it: see `default_tdir`.
+        # An empty value is not a directory, so it counts as not given.
+        "tdir":    (os.environ.get("SPANWEAVE_TDIR") or "").strip()
+                   or default_tdir(repo),
         "pinned":  os.environ.get("SPANWEAVE_PINNED", DEF_PINNED),
         "self":    [n for n in os.environ.get("SPANWEAVE_SELF", DEF_SELF)
                     .replace(",", " ").split() if n],

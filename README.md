@@ -1,10 +1,11 @@
 # spanweave-ops
 
 Read-only operator tooling for a **spanweave `WORKPLAN.md` series** — the
-run-by-run execution of a plan in `~/git/spanweave`. It was written for the
-audit-fixes series and is not tied to it: the branch it watches and the builder
-processes it watches for are **derived at arming time**, never named in a
-constant.
+run-by-run execution of a plan in a repo you name with `--repo` (default
+`~/git/spanweave`). It was written for the audit-fixes series and is not tied
+to it, nor to one repository: the branch it watches, the builder processes it
+watches for and the transcript directory it reads are all **derived from the
+repo at arming time**, never named in a constant.
 
 Nothing here writes to that repo. Nothing here runs `make`, `uv`, or `pytest`.
 The only writes are under `state/`, which is gitignored. `WATCH.md` is the
@@ -18,24 +19,27 @@ behaviour contract; this file is how to run it.
 | `watch_monitor.sh` | Arming path under the **Monitor** tool. Re-invokes `watch_run.sh` forever; forwards only event blocks to stdout, banners to `state/poll.log`, plus an hourly `HEARTBEAT`. Stops on a terminal trigger. |
 | `watch_loop.sh` | Arming path in a **plain terminal**. Re-invokes `watch_run.sh` forever, everything to the terminal. Stops on a terminal trigger. |
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
-| `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set. |
+| `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set — both read from the watched repo, which is why it also pulls `--repo` out of argv for the two looping front ends. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 290 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch and PID defaults, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh`. |
+| `selftest.sh` | 339 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch, PID and transcript-directory defaults, `--repo` reaching arming on every entry point, the batch-id pattern over an `R`-prefixed plan, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh` or the real `pgrep`. |
 
 ## What you have to pass, and what you do not
 
-Three things are **derived**, so the only flags a normal invocation needs are
-`--run`, `--batches` and `--base`:
+Four things are **derived**, so the only flags a normal invocation needs are
+`--run`, `--batches` and `--base` — plus `--repo` when the series is not in
+`~/git/spanweave`:
 
 | | derived from | pass it only when |
 |---|---|---|
-| the branch | `git symbolic-ref --short HEAD` in `~/git/spanweave`, read **once at arming** | you want to watch a branch the repo is not on — which is also what arms the wrong-branch tripwire |
-| the builder PID set | the `claude --dangerous…` processes alive **at arming**, via `pgrep` | you know which processes are the builder's and the derived set is wrong |
+| the branch | `git symbolic-ref --short HEAD` in the watched repo, read **once at arming** | you want to watch a branch the repo is not on — which is also what arms the wrong-branch tripwire |
+| the builder PID set | the `claude --dangerous…` processes alive **at arming** whose working directory is inside the watched repo, via `pgrep` | you know which processes are the builder's and the derived set is wrong |
+| the transcript directory | Claude Code's project directory for the watched repo — its absolute path with every non-alphanumeric character replaced by `-` | Claude Code's encoding changes, or the sessions are under another path; then `SPANWEAVE_TDIR=<dir>` |
 | the builder transcript | the derivation rule in `WATCH.md` — prompt, run number, not-an-aux-session, **and last written no earlier than the base commit**; failing the run number, the one post-base non-aux transcript about the plan, if there is exactly one | the derivation cannot see your session, or two post-base sessions could be it; then `SPANWEAVE_PINNED=<uuid>.jsonl` |
 
-None of the three is a constant any more, and that is the point: each one named
-a *session*, so each was stale by the run after the one it was written for. See
-the note at the end of this file.
+None of the four is a constant any more, and that is the point: three of them
+named a *session* and one named a *repository*, so each was stale by the run —
+or the project — after the one it was written for. See the note at the end of
+this file.
 
 ## Invocations
 
@@ -349,3 +353,15 @@ branch from the checkout and from a detached HEAD, the PID set from a synthetic
 `pgrep` (including that the `pgrep` wrapper never enrols itself in the set it
 is about to watch), and the fact that an empty set and an unset one are
 different answers.
+
+**And a constant that names a repository is a lie in the next project.** On
+2026-10-04 a second series opened — `spanweave-live`, with its own branch, its
+own plan and its own builder — and `DEF_TDIR` named
+`~/.claude/projects/-home-msi-git-spanweave`. A check pointed at the new repo
+with `SPANWEAVE_REPO` read that repo's branch and that repo's commits while the
+transcript, the liveness timestamp and the sub-agent activity all came from the
+*other* project's sessions, and the PID set was armed on whichever builder
+happened to be running anywhere on the machine — so `builder gone` would have
+fired when a stranger finished and stayed silent when the watched builder died.
+The repo is a parameter now, and the branch, the PID set and the transcript
+directory are read from it.
