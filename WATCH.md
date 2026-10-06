@@ -610,8 +610,24 @@ a commit **declares** a memo batch. The memo set is per-run and passed with
 2's ids and none of run 3's `R1`–`R7`. Every run-3 row read as `<row missing>`,
 every run-3 declaration was invisible to the tripwire, and the status report's
 `0/7 batches stopped, active: <all seven>` was a default rather than an
-observation. It is now `[A-Z]\d+`: which letter a plan uses is the plan's
-business.
+observation. It is now `[A-Z]\d+[a-z]?`: which letter a plan uses is the plan's
+business, and so is whether a batch inserted after its neighbour shipped gets a
+suffix.
+
+*A lower-case suffix is part of the id.* The receiver series inserted `R2a`,
+`R2b` and `R2c` after `R2` had already shipped, and `[A-Z]\d+` saw none of
+them — not as a near-miss but as nothing at all. The cause is the `\b` after
+the group: in `plan: R2a done` the pattern matches `R2`, then the boundary
+assertion fails between `2` and `a`, so the subject declared **no** batch; and
+`^\|\s*([A-Z]\d+)\s*\|` skipped the `| R2a |` row for the same reason. Three
+rows read as `<row missing>` and three plan commits declared nothing — the
+`[A-H]` blindness again, one level down. The suffix is a **single** lower-case
+letter, so `R2ab` is not an id; and because `[a-z]?` is greedy, `R2a` is never
+read as a declaration of `R2`. **`R2a` and `R2` are different batches** —
+folding them together would report `R2`'s shipped status for a row that has not
+run. The fold to one spelling is `canon_batch_id`, not `.upper()`: upper-casing
+turned `R2a` into `R2A`, which matches no row and reads as a fourth batch, so
+the letter and digits go up and the suffix goes down.
 
 *Row statuses are prefix-matched.* `is_stopped` tested `done` and `dropped` by
 equality while `awaiting` and `blocked` were prefix-matched. The plan does not

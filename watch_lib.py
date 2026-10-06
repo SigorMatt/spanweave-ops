@@ -312,19 +312,52 @@ def git_in(repo):
 # whole watcher - rows read as "<row missing>", so "0/7 stopped, active: all
 # seven" was a default, not an observation.  A batch id is a capital letter and
 # digits; which letter is the plan's business, not the watcher's.
-BATCH_ID = r"[A-Z]\d+"
+#
+# A LOWER-CASE SUFFIX is part of the id too.  The receiver series inserted R2a,
+# R2b and R2c after R2 had already shipped, and `[A-Z]\d+` could not see any of
+# them - not as a near-miss but as nothing at all, because of the `\b` that
+# follows the group: in "plan: R2a done" the pattern matches "R2" and then the
+# boundary assertion fails between "2" and "a", so the subject declared NO
+# batch, and `^\|\s*(R2)\s*\|` likewise skipped the "| R2a |" row.  So the
+# three rows read as "<row missing>" and the three plan commits declared
+# nothing - the same class of silent blindness the A-H generalisation fixed,
+# one level down.  The suffix is a single lower-case letter: `R2ab` is not an
+# id, and the greedy `[a-z]?` means "R2a" is never read as a declaration of
+# "R2".  R2a and R2 are DIFFERENT BATCHES; conflating them would report R2's
+# shipped status for a row that has not run.
+BATCH_ID = r"[A-Z]\d+[a-z]?"
 DECL_BODY_RE = re.compile(r"^\s*Batch\s+(%s)\s+of\s+WORKPLAN\.md\b" % BATCH_ID,
                           re.I | re.M)
 DECL_SUBJ_RE = re.compile(r"^\s*plan:\s*(%s)\b" % BATCH_ID, re.I)
+
+# Both regexes are case-insensitive, so the id has to be folded to one spelling
+# before it can be compared or used as a key.  `.upper()` was right while an id
+# was all letters-and-digits; it is wrong now, because it folds "R2a" to "R2A",
+# which matches no row and reads as a fourth batch.  The letter and digits go
+# up, the suffix goes down.
+_CANON_RE = re.compile(r"^([A-Za-z])(\d+)([A-Za-z]?)$")
+
+
+def canon_batch_id(batch_id):
+    """`R2a`, however it was spelled.  An id that is not batch-shaped is
+    upper-cased and handed back unchanged otherwise - this is a normaliser, not
+    a validator, and the regexes above are what decide what an id is."""
+    text = (batch_id or "").strip()
+    m = _CANON_RE.match(text)
+    if not m:
+        return text.upper()
+    letter, digits, suffix = m.groups()
+    return letter.upper() + digits + suffix.lower()
 
 
 def declared_batches(subject, body):
     """The batch ids a commit *declares*, in the two forms above.  Returns a
     sorted list; prose mentions are deliberately not included."""
-    found = set(m.group(1).upper() for m in DECL_BODY_RE.finditer(body or ""))
+    found = set(canon_batch_id(m.group(1))
+                for m in DECL_BODY_RE.finditer(body or ""))
     m = DECL_SUBJ_RE.match(subject or "")
     if m:
-        found.add(m.group(1).upper())
+        found.add(canon_batch_id(m.group(1)))
     return sorted(found)
 
 
@@ -942,8 +975,9 @@ def workplan_statuses(repo):
         fields = line.replace("\\|", "\x00").split("|")
         if len(fields) < 5:
             continue
-        out[m.group(1)] = fields[-3].strip().replace("\x00", "|")
-        raw[m.group(1)] = line
+        row_id = canon_batch_id(m.group(1))
+        out[row_id] = fields[-3].strip().replace("\x00", "|")
+        raw[row_id] = line
     return out, raw, source
 
 

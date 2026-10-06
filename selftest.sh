@@ -2169,7 +2169,7 @@ def c(name, got, want):
         bad = 1
 
 
-c("the pattern itself admits R and a digit", BATCH_ID, r"[A-Z]\d+")
+c("the pattern itself admits R and a digit", BATCH_ID, r"[A-Z]\d+[a-z]?")
 # The receiver series' own plan commits, verbatim.
 c("a plan: subject declares an R batch",
   declared_batches("plan: R0 done, and the pins are HTTPS so CI can check out"
@@ -2194,6 +2194,138 @@ c("an R-prefixed batch list is read, not reported missing",
   (source, statuses),
   ("worktree", {"R0": "done (`696702f`)", "R1": "done (`a4fec60`)",
                 "R2": "todo"}))
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# ---------------------------------------------------------------------------
+echo
+echo "a lower-case suffix is part of the batch id: R2a is not R2"
+# ---------------------------------------------------------------------------
+# The receiver series inserted R2a, R2b and R2c AFTER R2 had already shipped.
+# `[A-Z]\d+` saw none of the three - not as a near-miss but as nothing at all,
+# because of the `\b` after the group: in "plan: R2a done" the pattern matches
+# "R2" and the boundary assertion then fails between "2" and "a", so the
+# subject declared no batch; and `^\|\s*([A-Z]\d+)\s*\|` skipped the "| R2a |"
+# row the same way.  So three rows read as "<row missing>" and three plan
+# commits declared nothing.  The pattern is `[A-Z]\d+[a-z]?` now.
+#
+# The trap this section exists to hold shut is the OTHER failure: reading
+# "R2a" as a declaration of "R2".  R2 is `done (d762484)` and R2c is
+# `awaiting PR #4`; a watcher that folded the suffix away would report R2's
+# shipped status for a row that has not run.  So every case below asserts the
+# WHOLE list, not membership - `["R2a"]`, never `"R2a" in ...` - because a
+# spurious "R2" is exactly what membership would miss.  A plain directory is
+# fixture enough for the row cases: `workplan_statuses` reads the worktree
+# file and only falls back to git when there is none.
+RSUF="$TMP/repoSuffix"; mkdir -p "$RSUF"
+cat > "$RSUF/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| ID | Batch | Status | Calls |
+|---|---|---|---|
+| R2 | routing and conformance gate A | done (`d762484`) | 15 |
+| R2a | the run-1 review's items, closed | done (`7fdbff3`) | 8 |
+| R2b | the remainder has a caller-set cap | done (`d152c3b`) | 5 |
+| R2c | pins bumped to a spanweave that ships py.typed | awaiting PR #4 | 4 |
+| R3 | completion is a policy with an injected clock | done (`e09af3f`) | 10 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+python3 - "$RSUF" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import (BATCH_ID, canon_batch_id, declared_batches, first_todo,
+                       is_stopped, workplan_statuses)
+
+bad = 0
+
+
+def c(name, got, want):
+    global bad
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r\n        want %r" % (name, got, want))
+        bad = 1
+
+
+# --- the pattern, directly.
+c("the pattern admits a single lower-case suffix", BATCH_ID, r"[A-Z]\d+[a-z]?")
+
+# --- subjects.  These are the receiver series' own plan subjects, verbatim.
+c("a plan: subject declares R2a",
+  declared_batches("plan: R2a done, and one of its items was closed by the"
+                   " plan commit", ""), ["R2a"])
+c("a plan: subject declaring R2a does NOT declare R2",
+  declared_batches("plan: R2a done, and one of its items was closed by the"
+                   " plan commit", ""), ["R2a"])
+c("plan: R2b is R2b",
+  declared_batches("plan: R2b done, and the framer's line numbers are its own"
+                   " from now on", ""), ["R2b"])
+c("the unsuffixed id still declares itself and nothing more",
+  declared_batches("plan: R2 done, and its mutation criterion was wrong", ""),
+  ["R2"])
+c("a suffix is one letter: R2ab declares no batch",
+  declared_batches("plan: R2ab done", ""), [])
+c("the suffix is not a digit's neighbour: R2a9 declares no batch",
+  declared_batches("plan: R2a9 done", ""), [])
+
+# --- bodies.
+c("a body line declares R2a",
+  declared_batches("review: run-1's findings closed - five tests that could"
+                   " not fail now can",
+                   "Batch R2a of WORKPLAN.md.  SPEC sections 3.3, 3.4."),
+  ["R2a"])
+c("a body line declaring R2a does NOT declare R2",
+  declared_batches("framing: the remainder has a caller-set cap",
+                   "Batch R2b of WORKPLAN.md.  SPEC section 3.4."), ["R2b"])
+c("R2 and R2a are two batches, not one declared twice",
+  declared_batches("plan: R2 done",
+                   "Batch R2a of WORKPLAN.md."), ["R2", "R2a"])
+# A citation is still not a declaration, suffix or no suffix: the R2a row is
+# the one that cites R2's review file in prose.
+c("R2a cited in prose is not a declaration",
+  declared_batches("plan: R3 done",
+                   "R2a closed the run-1 review; this does not re-open it."),
+  ["R3"])
+
+# --- the fold.  `.upper()` folded R2a to R2A, which matches no row and reads
+# as a fourth batch; the letter and digits go up, the suffix goes down.
+c("canon leaves a canonical id alone", canon_batch_id("R2a"), "R2a")
+c("canon lifts the letter and lowers the suffix", canon_batch_id("r2A"), "R2a")
+c("canon does not invent a suffix", canon_batch_id("R2"), "R2")
+c("a lower-case subject folds to the canonical id, suffix intact",
+  declared_batches("plan: r2a done", ""), ["R2a"])
+c("a lower-case body line folds the same way",
+  declared_batches("x: y", "batch r2A of WORKPLAN.md."), ["R2a"])
+
+# --- rows.  This is the half that read as "<row missing>".
+statuses, raw, source = workplan_statuses(sys.argv[1])
+c("a suffixed row is read, not reported missing",
+  (source, statuses),
+  ("worktree", {"R2": "done (`d762484`)", "R2a": "done (`7fdbff3`)",
+                "R2b": "done (`d152c3b`)", "R2c": "awaiting PR #4",
+                "R3": "done (`e09af3f`)"}))
+c("the suffixed rows carry their OWN status, not R2's",
+  [statuses.get("R2"), statuses.get("R2c")],
+  ["done (`d762484`)", "awaiting PR #4"])
+c("every suffixed row has a raw line of its own",
+  sorted(k for k in raw if k.startswith("R2")), ["R2", "R2a", "R2b", "R2c"])
+c("the raw line for R2a is R2a's line, not R2's",
+  raw["R2a"].split("|")[2].strip(),
+  "the run-1 review's items, closed")
+# And the consequence the status report cares about: R2c is `awaiting`, which
+# is stopped, so with R2c the only unstopped candidate there is no todo - the
+# exact state run 2 ended in.  A watcher that could not see the row would have
+# answered from a default instead.
+c("awaiting PR #4 is a stopped status", is_stopped(statuses["R2c"]), True)
+c("no batch is todo once the suffixed rows are visible",
+  first_todo(statuses, ["R2", "R2a", "R2b", "R2c", "R3"]), None)
 sys.exit(bad)
 PY
 [ $? -eq 0 ] || fail=1
