@@ -422,6 +422,77 @@ by run number` or `pin (no candidate)`. A file the floor *chose* is dropped
 from the rejected list, because "refused for naming no run 5" is no longer a
 true thing to say about the file on the line above it.
 
+### Which *directory* the transcripts are in
+
+Everything above asks which file in the directory is the builder's. This asks
+where the directory is, which had a one-line answer until it did not: Claude
+Code names a project directory after the absolute path of the directory the
+session was started in, with every non-alphanumeric character replaced by `-`,
+so `--repo ~/git/spanweave` derives
+`~/.claude/projects/-home-msi-git-spanweave`. That assumes the builder's
+session was started **in** the watched repo.
+
+**Why this exists.** On 2026-10-10, run 2 of the zoo series was driven by a
+builder whose cwd is `~/git/spanweave`, dispatching sub-agents that write in
+`~/git/spanweave-zoo` — so `-home-msi-git-spanweave-zoo` does not exist at all.
+Both entry points exited 2 with `no builder transcript found for run 2`, about
+a run whose builder was alive, orchestrating, and six sub-agents in. The repo
+path is still the right handle on the *watch*; it is just not always the right
+handle on the *directory*.
+
+So when the derived directory **does not exist, or holds no candidate at all**,
+the question is asked of every `~/.claude/projects/*/` instead. A transcript
+is in the swept pool when it carries its own evidence of being about this repo:
+
+* an entry whose `cwd` is the repo or a path inside it — the session, or a tool
+  call in it, actually worked there; **or**
+* a `lastPrompt` that names the repo by path, in either `/home/you/git/x` or
+  `~/git/x` form — which is how a dispatching builder says what it is about
+  when its own cwd is somewhere else.
+
+A path is matched with a right boundary, for the same reason a run number is:
+`~/git/spanweave` must not match a prompt that only ever says
+`~/git/spanweave-zoo`, because those are two different repos and a watch on one
+must not derive onto the other's builder.
+
+**Everything above still applies to the swept pool.** The five candidate rules,
+the base-time floor, the floor read forwards and the ambiguity halt are run
+once, over whichever pool is in play — the sweep is a wider *search*, never a
+relaxed *rule*. `selftest.sh` pins each of those separately: a newer swept
+run-1 builder does not win a run-2 watch, a swept aux prompt is refused, a
+swept transcript older than the base is floored, two swept floor-clearing
+sessions halt rather than guess, and the sweep never derives onto this
+session's own transcript.
+
+**The derived directory keeps its answer whenever it has one.** Only "nothing
+in this directory was ever a candidate" falls through. `HOW_FLOOR` ("liveness
+is unknown for this base") and `HOW_AMBIGUOUS` ("two clear the floor, pin one")
+are *findings* about a directory that does hold candidates, and overriding
+either with a wider search would turn an honest degradation into a guess.
+
+When the sweep answered, both front ends say so — `status_check.sh` on its own
+line before anything derived from it, `watch_run.sh` on every poll banner:
+
+```
+transcripts: derived from /home/msi/.claude/projects/-home-msi-git-spanweave (repo cwd not a project)
+```
+
+**The PID set follows.** `builder gone` is armed on builder-shaped `claude`
+processes whose cwd is inside the watched repo, and the dispatching builder's
+cwd is not — it is in the directory its project name encodes. So when the sweep
+answered, arming also accepts a process whose cwd is that directory. The
+directory is not decoded from the project name, which is lossy and
+irreversible: the chosen transcript's own `cwd` entries are read and the one
+that *encodes to* that project name is the answer. Evidence checked against the
+encoding, rather than a guess shaped like one. With no such cwd stated — an
+operator who set `SPANWEAVE_TDIR` by hand — there is no extra root and the
+scope is the repo alone, as before.
+
+`SPANWEAVE_PROJECTS` overrides the root the sweep walks, for the same two
+reasons `SPANWEAVE_TDIR` overrides the directory: an operator may know better,
+and `selftest.sh` must be able to keep its promise that it never reads the real
+transcript corpus.
+
 ## Where the batch rows come from
 
 The last batch of the series, **G4**, is *"Series close: … remove

@@ -2903,6 +2903,304 @@ sys.exit(bad)
 PY
 [ $? -eq 0 ] || fail=1
 
+# ---------------------------------------------------------------------------
+echo "the repo whose cwd is nobody's project directory - the cross-project sweep"
+# ---------------------------------------------------------------------------
+# 2026-10-10, run 2 of the zoo series: the builder's cwd is ~/git/spanweave and
+# it dispatches sub-agents that write in ~/git/spanweave-zoo, so
+# ~/.claude/projects/-home-msi-git-spanweave-zoo does not exist at all. Both
+# entry points exited 2 with "no builder transcript found for run 2" about a
+# run whose builder was alive, orchestrating and six sub-agents in - because
+# `default_tdir` assumes the session was started IN the watched repo.
+#
+# So when the derived directory cannot answer, the question is asked of every
+# project directory, and a transcript is about this repo on evidence it carries
+# itself: an entry whose `cwd` is the repo, or a lastPrompt that names the repo
+# by path. The rules that follow are unchanged, which is what the cases below
+# are for: the floor, the run number, the aux test and self-exclusion all still
+# apply, and the primary directory keeps its answer whenever it has one.
+RZ="$TMP/repoz"; mkdir -p "$RZ"
+git -C "$RZ" init -q -b zoo
+git -C "$RZ" config user.email t@example.invalid
+git -C "$RZ" config user.name Selftest
+cat > "$RZ/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| A3a | thing | todo | 20 |
+| A3b | thing | awaiting A3a | 15 |
+
+## 4. Resume note
+
+- run 2 opens.
+
+---
+MD
+git -C "$RZ" add -A
+GIT_COMMITTER_DATE='2026-10-10 02:41:21' GIT_AUTHOR_DATE='2026-10-10 02:41:21' \
+  git -C "$RZ" commit -qm "plan: run 2 of the zoo series"
+BASEZ="$(git -C "$RZ" rev-parse HEAD)"
+
+# A projects root of our own, so this section reads fixtures and never the real
+# corpus - the header's promise, which the sweep would otherwise break.
+PROJ="$TMP/projects"; mkdir -p "$PROJ"
+# The project directory the DISPATCHING builder's session really has: named
+# after ~/git/spanweave-like cwd, not after the watched repo. Encoded exactly
+# as Claude Code encodes it, because `project_cwd` checks the encoding.
+DRIVER="$TMP/driver"; mkdir -p "$DRIVER"
+PD="$PROJ/$(printf '%s' "$DRIVER" | sed 's/[^A-Za-z0-9]/-/g')"
+mkdir -p "$PD"
+# ... and the directory the watch derives from --repo, which does not exist.
+ZD="$PROJ/$(printf '%s' "$RZ" | sed 's/[^A-Za-z0-9]/-/g')"
+
+# The run-2 builder: names the repo by path in its prompt, carries the driver's
+# cwd on its entries, and is orchestrating (a subagents/ dir).
+LPZ="Run 2 of the zoo series. In $RZ on zoo (b913e2b): copy ~/Downloads/decisions-zoo-2026-10-10.md to $RZ/patches/ (gitignored); read WORKPLAN.md §0 in full; apply patches/…"
+mk() {  # mk <dir> <stem> <cwd> <lastPrompt> <mtime> [subagents-mtime]
+  mkdir -p "$1"
+  printf '{"type":"user","cwd":"%s","uuid":"u1"}\n' "$3" > "$1/$2.jsonl"
+  printf '{"type":"last-prompt","lastPrompt":"%s"}\n' "$4" >> "$1/$2.jsonl"
+  if [ -n "${6:-}" ]; then
+    mkdir -p "$1/$2/subagents"; : > "$1/$2/subagents/a.jsonl"
+    touch -d "$6" "$1/$2/subagents/a.jsonl" "$1/$2/subagents"
+  fi
+  touch -d "$5" "$1/$2.jsonl"
+}
+mk "$PD" builderz "$DRIVER" "$LPZ" '2026-10-10 03:03:50' '2026-10-10 03:02:36'
+# An aux session in the same directory, about the same repo: a reviewer.
+mk "$PD" reviewz "$DRIVER" "Review WORKPLAN.md commits since 998f1cd in $RZ on zoo, per its WORKPLAN.md §0.2: one sub-agent per code commit…" '2026-10-10 02:53:56' '2026-10-10 02:24:10'
+# A session about another repo entirely, newer than all of them: must never be
+# swept in, because nothing in it is about this repo.
+mk "$PD" strangerz "$TMP/elsewhere" "Run 2 of some other series. In $TMP/elsewhere, read WORKPLAN.md §0 and apply it…" '2026-10-10 03:10:00' '2026-10-10 03:09:00'
+
+derz() {  # derz <run> [tdir] -> "<name>|<how>|<tdir-used>"
+  SPANWEAVE_REPO="$RZ" SPANWEAVE_PROJECTS="$PROJ" SPANWEAVE_BASE="$BASEZ" \
+  SPANWEAVE_RUN="$1" SPANWEAVE_TDIR="${2:-$ZD}" SPANWEAVE_BRANCH="zoo" \
+  SPANWEAVE_PINNED="" SPANWEAVE_SELF="${SELFZ:-}" CLAUDE_CODE_SESSION_ID="" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import config, derive_transcript_in
+tdir, name, lp, cands, how, rej = derive_transcript_in(config())
+print("%s|%s|%s" % (name, how, tdir))
+PY
+}
+
+check "the derived directory does not exist, so the sweep answers" \
+      "$(derz 2)" "builderz.jsonl|derived|$PD"
+# The two sessions the sweep must NOT return, proven by taking the builder away
+# so that each would win if it were eligible: the reviewer is an aux prompt, and
+# the stranger - newer than everything here - is about another repo entirely, so
+# neither cwd nor prompt makes it about this one.
+mv "$PD/builderz.jsonl" "$TMP/builderz.hold"
+check "with the builder gone the sweep returns neither the aux nor the stranger" \
+      "$(derz 2)" "None|none|$ZD"
+mv "$TMP/builderz.hold" "$PD/builderz.jsonl"
+
+# The run-number rule still applies to the swept pool: a newer session that
+# names run 1 must not win a run-2 watch.
+mk "$PD" run1z "$DRIVER" "Run 1 of the zoo series: read WORKPLAN.md §0 and apply it in $RZ…" '2026-10-10 03:08:00' '2026-10-10 03:07:00'
+check "a newer swept run-1 builder does not win a run-2 watch" \
+      "$(derz 2)" "builderz.jsonl|derived|$PD"
+check "...and is itself the answer for run 1" \
+      "$(derz 1)" "run1z.jsonl|derived|$PD"
+rm -rf "$PD/run1z.jsonl" "$PD/run1z"
+
+# The floor read forwards reaches the swept pool too, and says which warrant
+# carried it: no prompt names run 7, and exactly one swept transcript is about
+# the plan and was written since the base.
+check "a run no prompt names is carried by the floor, and says so" \
+      "$(derz 7)" "builderz.jsonl|derived by floor, not by run number|$PD"
+
+# The floor still applies to the swept pool.
+touch -d '2026-10-09 01:00:00' "$PD/builderz.jsonl" "$PD/builderz/subagents/a.jsonl" "$PD/builderz/subagents"
+check "a swept transcript older than the base is refused by the floor" \
+      "$(derz 2)" "None|none (older than base)|$ZD"
+touch -d '2026-10-10 03:03:50' "$PD/builderz.jsonl"
+touch -d '2026-10-10 03:02:36' "$PD/builderz/subagents/a.jsonl" "$PD/builderz/subagents"
+check "and is chosen again once its write is back above the floor" \
+      "$(derz 2)" "builderz.jsonl|derived|$PD"
+
+# The primary directory keeps its answer whenever it has one. An empty
+# directory that EXISTS is still "no candidate", so the sweep runs; a directory
+# with a candidate of its own is not second-guessed.
+mkdir -p "$ZD"
+check "an empty derived directory still falls through to the sweep" \
+      "$(derz 2)" "builderz.jsonl|derived|$PD"
+mk "$ZD" ownz "$RZ" "Run 2 of the zoo series: read WORKPLAN.md §0 and apply it in $RZ…" '2026-10-10 02:50:00' '2026-10-10 02:49:00'
+check "a candidate in the derived directory wins, sweep not consulted" \
+      "$(derz 2)" "ownz.jsonl|derived|$ZD"
+# ... even though the swept builder is newer on both readings. That is the
+# point: the directory --repo names is the authority when it can answer.
+rm -rf "$ZD/ownz.jsonl" "$ZD/ownz"
+
+# HOW_FLOOR and HOW_AMBIGUOUS are answers, not silence: the sweep must not
+# override either. A floored candidate in the primary directory means liveness
+# is unknown for this base, which is a finding about a directory that DOES hold
+# candidates - overriding it with a wider search would turn an honest
+# degradation into a guess.
+mk "$ZD" oldz "$RZ" "Run 2 of the zoo series: read WORKPLAN.md §0 and apply it in $RZ…" '2026-10-09 01:00:00'
+check "the primary floor is not overridden by the sweep" \
+      "$(derz 2)" "None|none (older than base)|$ZD"
+rm -rf "$ZD/oldz.jsonl"
+mk "$ZD" amb1 "$RZ" "Apply WORKPLAN.md §0 in $RZ, one commit…" '2026-10-10 02:50:00'
+mk "$ZD" amb2 "$RZ" "Apply WORKPLAN.md §0 in $RZ, one commit per batch…" '2026-10-10 02:51:00'
+check "the primary ambiguity halt is not overridden by the sweep" \
+      "$(derz 2)" "None|none (two or more clear the floor)|$ZD"
+rm -rf "$ZD/amb1.jsonl" "$ZD/amb2.jsonl"
+
+# Two swept candidates that both name the run are an ORDERING case, not an
+# ambiguity, and the newer subagents/ directory wins - the same tiebreak the
+# derived directory uses.
+mk "$PD" builder2z "$DRIVER" "Run 2 of the zoo series: apply WORKPLAN.md §0 in $RZ, one commit per batch…" '2026-10-10 03:04:00' '2026-10-10 03:05:00'
+check "among two swept candidates the newer subagents/ dir wins" \
+      "$(derz 2)" "builder2z.jsonl|derived|$PD"
+rm -rf "$PD/builder2z.jsonl" "$PD/builder2z"
+# Ambiguity is the floor-forwards path's answer, and it reaches the sweep: two
+# swept sessions about the plan, neither naming an operative run, both since
+# the base. Guessing between them would be the 2026-10-01 drift with a new
+# cause, so the sweep halts exactly as the derived directory does.
+mv "$PD/builderz.jsonl" "$TMP/builderz.hold"
+mk "$PD" fc1z "$DRIVER" "Apply WORKPLAN.md §0 in $RZ as its header says, one commit…" '2026-10-10 03:04:00' '2026-10-10 03:03:00'
+mk "$PD" fc2z "$DRIVER" "Apply WORKPLAN.md §0 in $RZ, one commit per batch…" '2026-10-10 03:05:00' '2026-10-10 03:04:00'
+check "two swept floor-clearing sessions halt rather than guess" \
+      "$(derz 2)" "None|none (two or more clear the floor)|$ZD"
+rm -rf "$PD/fc1z.jsonl" "$PD/fc1z" "$PD/fc2z.jsonl" "$PD/fc2z"
+mv "$TMP/builderz.hold" "$PD/builderz.jsonl"
+
+# Self-exclusion reaches into the sweep too: a watcher session told about the
+# plan and the run is exactly the shape that can win here.
+check "the sweep never derives onto this session's own transcript" \
+      "$(SELFZ="builderz.jsonl" derz 2)" "None|none|$ZD"
+
+# cwd evidence alone, with no path in the prompt: the dispatching builder whose
+# prompt says only "the zoo repo" is still found, because its entries say where
+# it worked.
+mk "$PD" cwdonlyz "$RZ" "Run 2: read WORKPLAN.md §0 in full and apply it…" '2026-10-10 03:06:00' '2026-10-10 03:05:00'
+check "cwd on an entry is evidence enough, with no path in the prompt" \
+      "$(derz 2)" "cwdonlyz.jsonl|derived|$PD"
+rm -rf "$PD/cwdonlyz.jsonl" "$PD/cwdonlyz"
+
+# ---------------------------------------------------------------------------
+# `names_repo` - a path is cited with a boundary, like a run number
+# ---------------------------------------------------------------------------
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import names_repo, repo_forms
+
+bad = 0
+HOME = os.path.expanduser("~")
+for name, got, want in [
+    # The 2026-10-10 shape: a prompt naming the repo in ~ form.
+    ("a ~-form path names the repo",
+     names_repo("Run 2 of the zoo series. In ~/git/spanweave-zoo on zoo:",
+                HOME + "/git/spanweave-zoo"), True),
+    ("an absolute path names the repo",
+     names_repo("In %s/git/spanweave-zoo on zoo:" % HOME,
+                HOME + "/git/spanweave-zoo"), True),
+    # The boundary, and the reason it exists: these are two different repos and
+    # a watch on one must not derive onto the other's builder.
+    ("spanweave does not match a prompt naming only spanweave-zoo",
+     names_repo("In ~/git/spanweave-zoo on zoo:", HOME + "/git/spanweave"), False),
+    ("spanweave-zoo does not match a prompt naming only spanweave",
+     names_repo("In ~/git/spanweave on main:", HOME + "/git/spanweave-zoo"), False),
+    ("a trailing slash is still the repo",
+     names_repo("In ~/git/spanweave-zoo/ on zoo:",
+                HOME + "/git/spanweave-zoo"), True),
+    # A file inside the repo names the repo: the boundary is there to keep
+    # `spanweave` off `spanweave-zoo`, not to insist the path end the word.
+    ("a file inside the repo names the repo",
+     names_repo("read ~/git/spanweave-zoo/WORKPLAN.md",
+                HOME + "/git/spanweave-zoo"), True),
+    ("...and still does not match the sibling repo",
+     names_repo("read ~/git/spanweave-zoo/WORKPLAN.md",
+                HOME + "/git/spanweave"), False),
+    ("no path at all names nothing",
+     names_repo("Apply WORKPLAN.md §0", HOME + "/git/spanweave-zoo"), False),
+    ("an empty prompt names nothing",
+     names_repo(None, HOME + "/git/spanweave-zoo"), False),
+    ("both spellings are offered for a path under home",
+     len(repo_forms(HOME + "/git/spanweave-zoo")), 2),
+    ("a path outside home has one spelling",
+     len(repo_forms("/opt/zoo")), 1),
+]:
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# ---------------------------------------------------------------------------
+# `project_cwd` - the encoding is checked, never reversed
+# ---------------------------------------------------------------------------
+got="$(SPANWEAVE_OPS_DIR="$OPS_DIR" PD="$PD" DRIVER="$DRIVER" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import project_cwd
+print(project_cwd(os.environ["PD"], "builderz.jsonl"))
+PY
+)"
+check "project_cwd reads the driver's cwd out of the chosen transcript" \
+      "$got" "$DRIVER"
+# A directory whose name no stated cwd encodes to has no answer - the operator
+# named SPANWEAVE_TDIR by hand, say - and None is the honest one.
+got="$(SPANWEAVE_OPS_DIR="$OPS_DIR" PD="$PD" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import project_cwd
+print(project_cwd(os.path.join(os.path.dirname(os.environ["PD"]), "-not-encoded-by-any-cwd"),
+                  "builderz.jsonl"))
+PY
+)"
+check "project_cwd has no answer when no stated cwd encodes to the directory" \
+      "$got" "None"
+
+# ---------------------------------------------------------------------------
+# the PID scope accepts the dispatching builder's directory
+# ---------------------------------------------------------------------------
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import pids_in_repo
+
+REPO = "/home/u/git/zoo"
+DRV  = "/home/u/git/driver"
+PG = ("11 claude --dangerously-skip-permissions\n"   # in the repo
+      "22 claude --dangerously-skip-permissions\n"   # in the driver
+      "33 claude --dangerously-skip-permissions\n"   # a stranger
+      "44 claude\n")                                 # not builder-shaped
+CWDS = {11: REPO + "/sub", 22: DRV, 33: "/home/u/git/other", 44: REPO}
+
+def cwd_of(pid):
+    return CWDS.get(pid)
+
+bad = 0
+for name, got, want in [
+    ("without `also` only the repo's own builder is armed on",
+     pids_in_repo(PG, repo=REPO, cwd_of=cwd_of), ([11], [22, 33])),
+    ("with `also` the dispatching builder is armed on too",
+     pids_in_repo(PG, repo=REPO, cwd_of=cwd_of, also=[DRV]), ([11, 22], [33])),
+    ("a stranger is still outside, whatever `also` says",
+     pids_in_repo(PG, repo=REPO, cwd_of=cwd_of, also=[DRV])[1], [33]),
+    ("`also` naming the repo again changes nothing",
+     pids_in_repo(PG, repo=REPO, cwd_of=cwd_of, also=[REPO]), ([11], [22, 33])),
+    ("an empty `also` entry is ignored, not treated as a root",
+     pids_in_repo(PG, repo=REPO, cwd_of=cwd_of, also=[None, ""]), ([11], [22, 33])),
+    ("an unreadable cwd is outside, never armed on",
+     pids_in_repo(PG, repo=REPO, cwd_of=lambda p: None, also=[DRV]),
+     ([], [11, 22, 33])),
+]:
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
 exit "$fail"

@@ -128,9 +128,18 @@ def pid_cwd(pid):
         return None
 
 
-def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd):
+def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None):
     """-> (armed, outside): the builder-shaped `claude` PIDs whose working
-    directory is inside `repo`, and the builder-shaped ones that are not.
+    directory is inside `repo` or inside one of `also`, and the rest.
+
+    `also` exists for the dispatching builder: when the watched repo's own cwd
+    is nobody's project directory and the transcript was derived from another
+    project's (see `derive_transcript_in`), the builder driving this run has
+    its cwd in *that* directory, not in the repo - so a set scoped to the repo
+    alone is empty, and `builder gone` has no signal about the one process it
+    is actually about.  The caller passes the directory the chosen transcript's
+    project encodes, which is evidence read out of that transcript rather than
+    a second guess at where a builder might be.
 
     The command shape alone is not enough once the repo is a parameter.  Two
     series can be under way on this machine at the same time - and on
@@ -148,6 +157,13 @@ def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd):
     rather than quietly arming a trigger on a process it could not identify."""
     out = claude_processes() if pgrep_out is None else pgrep_out
     root = os.path.realpath(os.path.abspath(os.path.expanduser(repo))) if repo else None
+    roots = [root] if root else []
+    for extra in (also or []):
+        if not extra:
+            continue
+        r = os.path.realpath(os.path.abspath(os.path.expanduser(extra)))
+        if r not in roots:
+            roots.append(r)
     armed, outside = [], []
     for line in out.splitlines():
         parts = line.split(None, 1)
@@ -159,20 +175,20 @@ def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd):
             armed.append(pid)
             continue
         cwd = cwd_of(pid)
-        if cwd is not None and (cwd == root or cwd.startswith(root + os.sep)):
+        if cwd is not None and any(_within(cwd, r) for r in roots):
             armed.append(pid)
         else:
             outside.append(pid)
     return sorted(armed), sorted(outside)
 
 
-def arming_pids(pgrep_out=None, repo=None, cwd_of=pid_cwd):
+def arming_pids(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None):
     """The builder-shaped `claude` PIDs of `repo` alive now, sorted.
 
     Resolved once when a watch is armed, never per poll: `builder gone` fires
     when this set *shrinks*, and a set re-derived each poll can never shrink.
     See `arming.sh`, which is the only thing that should call this."""
-    return pids_in_repo(pgrep_out, repo, cwd_of)[0]
+    return pids_in_repo(pgrep_out, repo, cwd_of, also)[0]
 
 
 def config():
@@ -200,6 +216,14 @@ def config():
         # An empty value is not a directory, so it counts as not given.
         "tdir":    (os.environ.get("SPANWEAVE_TDIR") or "").strip()
                    or default_tdir(repo),
+        # The root the cross-project sweep walks when the repo's own cwd is
+        # nobody's project directory (see `derive_transcript_in`).  Overridable
+        # for the same two reasons `tdir` is: an operator may know better, and
+        # `selftest.sh` must be able to promise it never reads the real corpus
+        # - a sweep hard-wired to `DEF_PROJECTS` would have broken that promise
+        # the moment the fallback existed.
+        "projects": (os.environ.get("SPANWEAVE_PROJECTS") or "").strip()
+                    or DEF_PROJECTS,
         "pinned":  os.environ.get("SPANWEAVE_PINNED", DEF_PINNED),
         "self":    [n for n in os.environ.get("SPANWEAVE_SELF", DEF_SELF)
                     .replace(",", " ").split() if n],
@@ -583,11 +607,213 @@ def liveness_unknown_for_base(cfg):
     return how == HOW_FLOOR, base_author_time(cfg["repo"], cfg["base"]), rejected
 
 
+# ------------------------------- the repo whose cwd is nobody's project dir
+#
+# `default_tdir` assumes the builder's session was started *in* the watched
+# repo, because Claude Code names a project directory after the session's cwd.
+# On 2026-10-10 that assumption failed in the direction it had to fail
+# eventually: run 2 of the zoo series was driven from a builder whose cwd is
+# `~/git/spanweave`, dispatching sub-agents that write in `~/git/spanweave-zoo`
+# - so `~/.claude/projects/-home-msi-git-spanweave-zoo` does not exist at all,
+# and both front ends exited 2 with "no builder transcript found" about a run
+# whose builder was alive, orchestrating, and six sub-agents in.
+#
+# The repo path is still the right handle on the watch; it is just not the
+# right handle on the *directory*.  So when the derived directory cannot
+# answer, the question is asked of every project directory instead, and a
+# transcript is "about this repo" on either of two pieces of evidence it
+# carries itself:
+#
+#   * an entry whose `cwd` is the repo (or a path inside it) - the session, or
+#     a tool call in it, actually worked there; or
+#   * a `lastPrompt` that names the repo by path - which is how a dispatching
+#     builder says what it is about when its own cwd is somewhere else.
+#
+# Both are facts in the file, not inferences about the machine.  Neither
+# relaxes the rules that follow: the base-time floor, the run-number test, the
+# aux-prompt test and the self-exclusion are applied to this pool exactly as
+# they are to the derived directory's, which is the whole point of collecting a
+# pool rather than picking a file.
+
+CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# A sweep over every project directory reads every transcript, and the corpus
+# is hundreds of files and hundreds of megabytes.  `cwd` is written on the
+# session's own entries from the first one, so a bounded head is enough to find
+# it; the cap is on bytes rather than lines because one entry can be large.
+CWD_SCAN_BYTES = 256_000
+
+
+def _unescape(s):
+    try:
+        return json.loads('"%s"' % s)
+    except Exception:                          # noqa: BLE001
+        return s
+
+
+def transcript_cwds(path, limit=CWD_SCAN_BYTES):
+    """The distinct `cwd` values in the first `limit` bytes of a transcript.
+
+    Order-preserving and de-duplicated, so a caller can prefer the first.
+    Unreadable file -> empty: "we could not look" is not "it worked nowhere",
+    and every caller below treats an empty answer as no evidence rather than as
+    evidence of absence."""
+    seen, out, read = set(), [], 0
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                read += len(line)
+                for m in CWD_RE.finditer(line):
+                    v = _unescape(m.group(1))
+                    if v not in seen:
+                        seen.add(v)
+                        out.append(v)
+                if read >= limit:
+                    break
+    except OSError:
+        return []
+    return out
+
+
+def _within(path, root):
+    """Is `path` `root` or inside it?  Both already absolute and real."""
+    return path == root or path.startswith(root + os.sep)
+
+
+def worked_in(path, repo, limit=CWD_SCAN_BYTES):
+    """Does this transcript carry an entry whose `cwd` is `repo` or inside it?"""
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(repo)))
+    for c in transcript_cwds(path, limit):
+        if not c:
+            continue
+        if _within(os.path.realpath(os.path.abspath(os.path.expanduser(c))), root):
+            return True
+    return False
+
+
+def repo_forms(repo):
+    """The ways a prompt can spell `repo`: absolute, and `~`-abbreviated.
+
+    A builder prompt is written by a human, and a human writes `~/git/x`.  The
+    stored prompt is matched against both spellings rather than normalised,
+    because normalising a prompt's text would mean guessing what `~` meant in
+    a session whose home we are not reading."""
+    ab = os.path.abspath(os.path.expanduser(repo))
+    home = os.path.expanduser("~")
+    forms = {ab}
+    if _within(ab, home):
+        forms.add("~" + ab[len(home):])
+    return sorted(forms)
+
+
+def names_repo(lp, repo):
+    """Does this lastPrompt name `repo` by path?
+
+    Matched with a right boundary, so `~/git/spanweave` does not match a prompt
+    that only ever says `~/git/spanweave-zoo`: the two are different repos and
+    a watch on one must not derive onto the other's builder.  This is the same
+    citation/declaration care the run-number rules take, applied to paths."""
+    if not lp:
+        return False
+    return any(re.search(re.escape(f) + r"(?![\w.-])", lp) for f in repo_forms(repo))
+
+
+def project_pairs(repo, projects=None, skip=None):
+    """-> sorted [(tdir, name)] for transcripts about `repo` in ANY project dir.
+
+    `skip` is the directory already tried - excluded so its files are not
+    re-read and cannot be reported twice.  Sorted by (tdir, name) so the sweep
+    is deterministic; the ordering that *chooses* among these is the usual
+    (subagents mtime, own mtime) one, applied later by the shared derivation."""
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(repo)))
+    skip = os.path.abspath(skip) if skip else None
+    out = []
+    for d in sorted(glob.glob(os.path.join(projects or DEF_PROJECTS, "*"))):
+        if not os.path.isdir(d) or (skip and os.path.abspath(d) == skip):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
+            name = os.path.basename(path)
+            # The cheap test first: a `lastPrompt` is one scan the derivation
+            # needs anyway, where `cwd` evidence costs a head read of every
+            # file in the corpus.
+            if names_repo(last_prompt(path), repo) or worked_in(path, root):
+                out.append((d, name))
+    return sorted(out)
+
+
+def project_cwd(tdir, name):
+    """The directory `tdir`'s project name encodes, as the transcript states it.
+
+    The encoding in `default_tdir` is lossy - every non-alphanumeric character
+    becomes `-`, so `-home-msi-git-spanweave` could decode to a dozen paths and
+    cannot be reversed.  So it is not reversed: the transcript's own `cwd`
+    values are read and the one that *encodes to* this directory's name is the
+    answer.  Evidence, checked against the encoding, rather than a guess shaped
+    like one.
+
+    None when no stated cwd encodes to it - the operator named `SPANWEAVE_TDIR`
+    by hand, say - and then the caller has no extra PID root to accept, which
+    is the behaviour from before this existed."""
+    want = os.path.basename(os.path.abspath(tdir))
+    for c in transcript_cwds(os.path.join(tdir, name)):
+        if not c:
+            continue
+        ab = os.path.abspath(os.path.expanduser(c))
+        if re.sub(r"[^A-Za-z0-9]", "-", ab) == want:
+            return ab
+    return None
+
+
 def derive_transcript(cfg):
     """-> (name, lastPrompt, candidates, how, rejected)
 
-    candidates is a list of (sub_mtime, own_mtime, name, lastPrompt), best
-    first.  `how` is one of HOW_DERIVED, HOW_PIN, HOW_FLOOR or HOW_NONE."""
+    The five-tuple form, kept for callers that already know which directory
+    they are asking about.  `derive_transcript_in` is the one that answers
+    *which* directory, and this is a thin shim over it."""
+    _tdir, name, lp, cands, how, rejected = derive_transcript_in(cfg)
+    return name, lp, cands, how, rejected
+
+
+def derive_transcript_in(cfg):
+    """-> (tdir, name, lastPrompt, candidates, how, rejected)
+
+    The derived directory is tried first and keeps its answer whenever it has
+    one - including HOW_FLOOR and HOW_AMBIGUOUS, which are answers and not
+    silence.  Only HOW_NONE, "nothing in this directory was ever a candidate",
+    falls through to the cross-project sweep: the floor's "liveness is unknown
+    for this base" and the ambiguity halt are both findings about a directory
+    that *does* hold candidates, and overriding either with a wider search
+    would turn an honest degradation into a guess.
+
+    `tdir` is where the returned name lives, which is the derived directory
+    unless the sweep answered."""
+    tdir = cfg["tdir"]
+    pairs = [(tdir, os.path.basename(p))
+             for p in sorted(glob.glob(os.path.join(tdir, "*.jsonl")))]
+    name, lp, cands, how, rejected = _derive_over(cfg, pairs, tdir)
+    if how != HOW_NONE:
+        return tdir, name, lp, cands, how, rejected
+    wide = project_pairs(cfg["repo"], projects=cfg.get("projects"), skip=tdir)
+    if not wide:
+        return tdir, name, lp, cands, how, rejected
+    w_name, w_lp, w_cands, w_how, w_rejected = _derive_over(cfg, wide, tdir)
+    if w_name is None and w_how == HOW_NONE:
+        # The sweep found files about this repo and none of them was a
+        # candidate either.  The derived directory's answer is the one to
+        # report - it is the directory the operator's `--repo` names - but the
+        # sweep's refusals are the ones that say why the wider search did not
+        # help, so both lists are kept.
+        return tdir, None, None, cands, HOW_NONE, rejected + w_rejected
+    where = {n: d for d, n in wide}
+    chosen = where.get(w_name, tdir) if w_name else tdir
+    return chosen, w_name, w_lp, w_cands, w_how, w_rejected
+
+
+def _derive_over(cfg, pairs, report_dir):
+    """The derivation itself, over an explicit [(tdir, name)] pool.
+
+    Split out so the cross-project sweep runs the *same* rules as the derived
+    directory rather than a relaxed copy of them: the floor, the run-number
+    test, the aux test and the self-exclusion are all below, once."""
     run = cfg["run"]
     mine = self_names(cfg)
     # The base-time floor.  A transcript whose last write predates the base
@@ -629,8 +855,8 @@ def derive_transcript(cfg):
     # commit - whatever run number it names or fails to name.  Collected on
     # this same pass, so the fallback costs no second sweep of the directory.
     floor_clear = []
-    for path in sorted(glob.glob(os.path.join(cfg["tdir"], "*.jsonl"))):
-        name = os.path.basename(path)
+    for tdir, name in pairs:
+        path = os.path.join(tdir, name)
         lp = last_prompt(path)
         if name in mine:
             # Only worth reporting when it would otherwise have been a
@@ -648,7 +874,7 @@ def derive_transcript(cfg):
         lw = own_m = sub_m = None
         clears_floor = False
         if plan_shaped:
-            lw, own_m, sub_m = last_write(cfg["tdir"], name)
+            lw, own_m, sub_m = last_write(tdir, name)
             clears_floor = (base_at is None) or (lw >= base_at)
             # The pool needs the floor to have actually *said* something.  With
             # no readable base author time the floor refuses nothing, so
@@ -724,7 +950,7 @@ def derive_transcript(cfg):
     # number: an operator who names a file has said something the watcher's
     # evidence cannot outvote.
     if cfg["pinned"]:
-        pin = os.path.join(cfg["tdir"], cfg["pinned"])
+        pin = os.path.join(report_dir, cfg["pinned"])
         if os.path.exists(pin):
             return cfg["pinned"], last_prompt(pin), cands, HOW_PIN, rejected
     # No prompt named run N.  Read the floor forwards: among the transcripts

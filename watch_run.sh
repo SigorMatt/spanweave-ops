@@ -79,7 +79,7 @@ from watch_lib import (HOW_AMBIGUOUS, HOW_FLOOR, HOW_FLOOR_DERIVED,
                        STALL_QUIET_S, WAIT_QUIET_S, age, asks_question,
                        base_author_time, ci_conclusion,
                        claude_processes,
-                       config, declared_batches, derive_transcript, entry_line,
+                       config, declared_batches, derive_transcript_in, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, plan_at_rev, render,
                        resume_note_tail,
@@ -183,7 +183,12 @@ def main():
     idx_m = mtime(os.path.join(REPO, ".git", "index"))
 
     # -- transcript ----------------------------------------------------------
-    tname, tprompt, cands, how, rejected = derive_transcript(CFG)
+    tdir_used, tname, tprompt, cands, how, rejected = derive_transcript_in(CFG)
+    # The repo's own cwd is nobody's project directory and the derivation came
+    # from another project's: stated on every poll, like `how_note` below and
+    # for the same reason - the reader must not have to remember which
+    # directory the banner's transcript name is relative to.
+    wide = os.path.abspath(tdir_used) != os.path.abspath(TDIR)
     # Two different "no transcript" answers.  HOW_FLOOR means candidates existed
     # and every one of them was last written before the base commit, so the
     # builder's session is not visible from here: liveness is UNKNOWN, which is
@@ -211,8 +216,8 @@ def main():
         t_m = s_m = live = None
         entries, pending, followed = [], None, False
     else:
-        tpath = os.path.join(TDIR, tname)
-        sub   = subagents_dir(TDIR, tname)
+        tpath = os.path.join(tdir_used, tname)
+        sub   = subagents_dir(tdir_used, tname)
         t_m   = mtime(tpath)
         s_m   = newest_under(sub) if os.path.isdir(sub) else None
         live  = max([x for x in (t_m, s_m) if x is not None], default=None)
@@ -298,6 +303,8 @@ def main():
     # skimming a banner must not have to remember which rule chose the file.
     how_note = ("  <-- %s" % HOW_FLOOR_DERIVED if how == HOW_FLOOR_DERIVED
                 else "")
+    if wide:
+        how_note += "  <-- transcripts: derived from %s (repo cwd not a project)" % tdir_used
     banner = ("poll %s | run %d | watching %s%s%s | HEAD %s | origin %s | %s"
               " | pendingBackgroundAgentCount=%s | open: %s%s"
               % (stamp(now), RUN,

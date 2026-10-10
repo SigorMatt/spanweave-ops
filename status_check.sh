@@ -52,9 +52,10 @@ sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 from watch_lib import (ARM_CMD_PREFIX, HOW_AMBIGUOUS, HOW_FLOOR,
                        HOW_FLOOR_DERIVED, age, asks_question,
                        ci_conclusion, claude_processes,
-                       config, declared_batches, derive_transcript, entry_line,
+                       config, declared_batches, derive_transcript_in, entry_line,
                        git_in, is_stopped, limit_notice, live_pids, mtime,
                        newest_under, pending_agents, pids_in_repo, plan_at_rev,
+                       project_cwd,
                        resume_note_tail, stamp,
                        subagents_dir, substantive, tail_entries, verdict,
                        workplan_statuses)
@@ -73,6 +74,19 @@ MEMO    = CFG["memo"]
 
 now = time.time()
 git = git_in(REPO)
+
+# Derived here rather than in the section that prints it, because the builder-
+# process scope below needs it: when the repo's own cwd is nobody's project
+# directory, the builder's cwd is the chosen transcript's project directory and
+# a set scoped to the repo alone would be empty (see `pids_in_repo`'s `also`).
+# One derivation per report, used by both sections - two would be two sweeps
+# and could disagree.
+TDIR_USED, tname, tprompt, cands, how, rejected = derive_transcript_in(CFG)
+# The extra cwd the PID scope accepts, and the flag the transcript section
+# prints: both are "the derivation did not come from the directory --repo
+# names", which is one fact and is stated once.
+WIDE     = os.path.abspath(TDIR_USED) != os.path.abspath(TDIR)
+PID_ALSO = [project_cwd(TDIR_USED, tname)] if (WIDE and tname) else []
 
 
 def head(title):
@@ -193,7 +207,7 @@ if not PIDSET:
     # running a second series elsewhere has builder-shaped processes that this
     # watch is deliberately not armed on - reporting that as "none is running"
     # would be false about the machine while true about the watch.
-    _, outside = pids_in_repo(pgrep_out, repo=REPO)
+    _, outside = pids_in_repo(pgrep_out, repo=REPO, also=PID_ALSO)
     if outside:
         print("note             : %d builder-shaped process(es) (%r) are running,"
               % (len(outside), ARM_CMD_PREFIX))
@@ -213,7 +227,6 @@ print("\n".join("  " + l for l in shown) or "  (no matches)")
 
 # ------------------------------------------------------ builder transcript ---
 head("builder transcript (derivation rule: run %d)" % RUN)
-tname, tprompt, cands, how, rejected = derive_transcript(CFG)
 if tname is None:
     print("WATCHER ERROR: no builder transcript found for run %d in %s" % (RUN, TDIR))
     if how == HOW_FLOOR:
@@ -239,8 +252,14 @@ if tname is None:
     for name, why in rejected:
         print("  refused: %s  %s" % (name, why))
     sys.exit(2)
-tpath = os.path.join(TDIR, tname)
-sub   = subagents_dir(TDIR, tname)
+if WIDE:
+    # Said before anything derived from it, because it changes what the rest of
+    # this section is about: the transcript is not from the directory `--repo`
+    # names, and the reader has to know which directory it IS from to check the
+    # derivation by hand.
+    print("transcripts: derived from %s (repo cwd not a project)" % TDIR_USED)
+tpath = os.path.join(TDIR_USED, tname)
+sub   = subagents_dir(TDIR_USED, tname)
 t_m   = mtime(tpath)
 s_m   = newest_under(sub) if os.path.isdir(sub) else None
 live  = max([x for x in (t_m, s_m) if x is not None], default=None)
@@ -287,7 +306,7 @@ for e in entries[-10:]:
 # ------------------------------------------------------- sub-agent activity ---
 head("sub-agent activity")
 if not os.path.isdir(sub):
-    print("  no subagents/ directory under %s" % os.path.join(TDIR, tname[:-6]))
+    print("  no subagents/ directory under %s" % os.path.join(TDIR_USED, tname[:-6]))
 else:
     files = []
     for root, _d, names in os.walk(sub):
@@ -393,6 +412,6 @@ if asks:
 if limit_hit:
     print("  limit     : %r at %s" % (limit_hit[1], limit_hit[0]))
 print()
-print("TRANSCRIPT_DIR=%s" % TDIR)
+print("TRANSCRIPT_DIR=%s" % TDIR_USED)
 print("TRANSCRIPT_FILE=%s" % tpath)
 PY

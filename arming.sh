@@ -87,7 +87,25 @@ sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 import watch_lib
 
 repo = watch_lib.repo_dir()
-armed, outside = watch_lib.pids_in_repo(repo=repo)
+# The dispatching-builder case: when the repo's own cwd is nobody's project
+# directory, the transcript is derived from another project's and the builder
+# driving this run has its cwd THERE, not in the repo.  Arming is the only
+# place the PID set is fixed, so it is the only place that can accept it - a
+# set scoped to the repo alone would be empty here, and `builder gone` would be
+# disarmed against a builder that is alive and orchestrating.  Asked of the
+# derivation rather than guessed: `project_cwd` reads the directory out of the
+# chosen transcript's own entries.
+also = []
+try:
+    cfg = watch_lib.config()
+    tdir_used, tname = watch_lib.derive_transcript_in(cfg)[:2]
+    if tname and os.path.abspath(tdir_used) != os.path.abspath(cfg["tdir"]):
+        cwd = watch_lib.project_cwd(tdir_used, tname)
+        if cwd:
+            also.append(cwd)
+except Exception:                              # noqa: BLE001 - arming must not die
+    also = []
+armed, outside = watch_lib.pids_in_repo(repo=repo, also=also)
 print(watch_lib.default_branch(repo))
 print(" ".join(str(p) for p in armed))
 # Line 3: the scope's rejections, so an empty armed set is never confused with
@@ -95,10 +113,14 @@ print(" ".join(str(p) for p in armed))
 # is fixed - and because the usual cause is a second series under way in
 # another repo, which an operator who sees the PIDs can recognise at a glance.
 if outside:
+    # The scope is named in full, because with `also` it is no longer just the
+    # repo and a note that said "outside <repo>" would be false about what was
+    # armed on.
+    scope = repo + "".join(" or %s" % a for a in also)
     print("arming: %d builder-shaped claude process(es) are running outside %s"
           " and are not armed on (%s); 'builder gone' watches only the %d"
           " inside it."
-          % (len(outside), repo, " ".join(str(p) for p in outside), len(armed)))
+          % (len(outside), scope, " ".join(str(p) for p in outside), len(armed)))
 PY
 )" || out=""
 
