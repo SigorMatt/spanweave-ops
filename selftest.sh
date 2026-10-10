@@ -3221,6 +3221,81 @@ sys.exit(bad)
 PY
 [ $? -eq 0 ] || fail=1
 
+# ---------------------------------------------------------------------------
+echo "arming excludes the watcher's own session from the PID set"
+# ---------------------------------------------------------------------------
+# Armed from a Claude Code session - the Monitor path - the shell running
+# arming.sh descends from that session's `claude` process, which is
+# builder-shaped when the session runs --dangerously-skip-permissions and in
+# scope when its cwd is the repo.  It used to be armed on.
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import pids_in_repo, session_tree, builder_pids
+
+#        1 -> 10 (claude: the watcher's session) -> 20 (bash) -> 30 (arming shell)
+#                                                              -> 40 (its child)
+#        1 -> 50 (claude: the builder) -> 60 (its tool shell)
+PP = {10: 1, 20: 10, 30: 20, 40: 30, 50: 1, 60: 50}
+REPO = "/home/u/git/zoo"
+PG = ("10 claude --dangerously-skip-permissions\n"
+      "50 claude --dangerously-skip-permissions\n"
+      "70 claude --dangerously-skip-permissions\n")
+CWDS = {10: REPO, 50: REPO + "/sub", 70: "/elsewhere"}
+tree = session_tree(30, PP)
+bad = 0
+for name, got, want in [
+    ("the tree is the shell, its ancestors and its descendants",
+     sorted(tree), [1, 10, 20, 30, 40]),
+    ("a sibling session is not in the tree", 50 in tree or 60 in tree, False),
+    ("no shell pid is an empty tree, never everything", session_tree(0, PP), set()),
+    ("a ppid cycle terminates", sorted(session_tree(5, {5: 6, 6: 5})), [5, 6]),
+    ("the watcher's own claude is neither armed nor outside",
+     pids_in_repo(PG, repo=REPO, cwd_of=CWDS.get, exclude=tree), ([50], [70])),
+    ("without the exclusion it was armed on",
+     pids_in_repo(PG, repo=REPO, cwd_of=CWDS.get), ([10, 50], [70])),
+    ("builder_pids reads the same shape the scope did",
+     builder_pids(PG + "80 claude\nnot a line\n"), [10, 50, 70]),
+]:
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r want %r" % (name, got, want)); bad = 1
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# End to end, over the real process tree: a subshell whose cwd is the fixture
+# repo stands in for the watcher's `claude` (the pgrep stub names it
+# builder-shaped), and arming runs in a `bash -c` beneath it, so it is an
+# ancestor of the shell running arming.sh.  A `sleep` started from the same
+# directory, but not in that tree, stands in for the builder.
+( cd "$RA" && exec sleep 60 ) &
+SIBLING=$!
+own_out="$(
+  cd "$RA" && env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+    SPANWEAVE_REPO="$RA" \
+    PGREP_STUB_OUT="$BASHPID claude --dangerously-skip-permissions
+$SIBLING claude --dangerously-skip-permissions" bash -c '
+      . "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm
+      printf "PIDS=%s\n" "$SPANWEAVE_PIDS"'
+)"
+kill "$SIBLING" 2>/dev/null; wait "$SIBLING" 2>/dev/null
+check "the armed set is the builder alone, not the watcher's session" \
+      "$(printf '%s\n' "$own_out" | sed -n 's/^PIDS=//p')" "$SIBLING"
+printf '%s\n' "$own_out" | grep -q "^arming: excluded 1 builder-shaped claude process(es) as this watcher's own session" \
+  && ok "the arming note says how many it excluded" \
+  || bad "the arming note does not say how many it excluded: $own_out"
+printf '%s\n' "$own_out" | grep -q "^arming: excluded 1 .*: [0-9][0-9]*\.\$" \
+  && ok "and names the excluded PID" \
+  || bad "the arming note does not name the excluded PID"
+none_out="$(cd "$RA" && env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+  SPANWEAVE_REPO="$RA" PGREP_STUB_OUT="4000003 claude --dangerously-skip-permissions" \
+  bash -c '. "$SPANWEAVE_OPS_DIR/arming.sh"; spanweave_arm')"
+printf '%s\n' "$none_out" | grep -q "^arming: excluded 0 builder-shaped" \
+  && ok "a builder-shaped process outside the tree is counted as 0 excluded, out loud" \
+  || bad "arming does not say it excluded 0: $none_out"
+
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
 exit "$fail"

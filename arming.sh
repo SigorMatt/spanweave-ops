@@ -81,7 +81,9 @@ spanweave_arm() {
     return 0
   fi
 
-  out="$(python3 - <<'PY'
+  # `$$` is the shell running this file - the front end, or the shell that
+  # sourced it - not the `$(...)` subshell below, so the tree is the watcher's.
+  out="$(SPANWEAVE_ARM_SHELL="$$" python3 - <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 import watch_lib
@@ -105,10 +107,31 @@ try:
             also.append(cwd)
 except Exception:                              # noqa: BLE001 - arming must not die
     also = []
-armed, outside = watch_lib.pids_in_repo(repo=repo, also=also)
+# The watcher's own session is never a builder.  Armed from a Claude Code
+# session (the Monitor path), the shell running this file descends from that
+# session's `claude` process, which is builder-shaped whenever the session was
+# started with --dangerously-skip-permissions - and in scope whenever its cwd is
+# the repo.  Excluded before scoping, and counted, so the note can say so.
+pg = watch_lib.claude_processes()
+try:
+    shell = int(os.environ.get("SPANWEAVE_ARM_SHELL") or 0)
+except ValueError:
+    shell = 0
+tree = watch_lib.session_tree(shell)
+own = sorted(p for p in watch_lib.builder_pids(pg) if p in tree)
+armed, outside = watch_lib.pids_in_repo(pg, repo=repo, also=also, exclude=tree)
 print(watch_lib.default_branch(repo))
 print(" ".join(str(p) for p in armed))
-# Line 3: the scope's rejections, so an empty armed set is never confused with
+# Line 3: how many arming excluded as the watcher's own session - said even
+# when it is 0 whenever anything builder-shaped was seen, so a reader can tell
+# "none of these was the watcher" from an arming that never looked.  With
+# nothing builder-shaped running at all there is nothing to report, and arming
+# stays silent as it always has.
+if own or armed or outside:
+    print("arming: excluded %d builder-shaped claude process(es) as this watcher's"
+          " own session (the process tree of shell %d)%s."
+            % (len(own), shell, (": " + " ".join(str(p) for p in own)) if own else ""))
+# Line 4: the scope's rejections, so an empty armed set is never confused with
 # "no builder is running".  Said once, at arming, because that is when the set
 # is fixed - and because the usual cause is a second series under way in
 # another repo, which an operator who sees the PIDs can recognise at a glance.
@@ -142,7 +165,7 @@ PY
     export SPANWEAVE_PIDS
     # Only when this arming actually derived the set: a note about PIDs we did
     # not arm on makes no sense beside an operator's own `--pids`.
-    scope_note="$(printf '%s\n' "$out" | sed -n 3p)"
+    scope_note="$(printf '%s\n' "$out" | sed -n '3,$p')"
     [ -n "$scope_note" ] && printf '%s\n' "$scope_note"
   fi
   spanweave_liveness_note

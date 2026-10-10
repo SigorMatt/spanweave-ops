@@ -97,6 +97,18 @@ ours". Arming prints one line naming the builder-shaped processes the scope
 refused, so an armed set that is empty is never confused with *no builder is
 running* — and `status_check.sh` says the same thing in its own words.
 
+**The watcher's own session is never in it.** A watch armed from a Claude Code
+session — the Monitor path — runs in a shell descended from that session's
+`claude` process, and that process is builder-shaped whenever the session was
+started with `--dangerously-skip-permissions`, and in scope whenever its cwd is
+the repo. Until 2026-10-10 arming armed on it. Arming now takes the process
+tree of the shell running `arming.sh` — that shell, its ancestors and its
+descendants, read from `/proc` — and excludes every PID in it before scoping.
+Whenever anything builder-shaped is running, arming says how many it excluded,
+0 included: `arming: excluded N builder-shaped claude process(es) as this
+watcher's own session (the process tree of shell S): P …`. With nothing
+builder-shaped running it stays silent, as before.
+
 `watch_monitor.sh` and `watch_loop.sh` re-invoke `watch_run.sh` every few
 minutes, so **they** arm, at their own start, and export both down; a
 `watch_run.sh` started directly arms for itself. Whoever arms first owns both
@@ -831,7 +843,7 @@ commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to overrid
 
 ## Verified
 
-`./selftest.sh` — 400 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 411 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched — and, since 2026-10-04, the real `pgrep`
 not run either: arming now says which builder-shaped processes its repo scope
 refused, so a case that read the machine put this machine's live sessions into

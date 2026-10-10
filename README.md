@@ -21,7 +21,7 @@ behaviour contract; this file is how to run it.
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set — both read from the watched repo, which is why it also pulls `--repo` out of argv for the two looping front ends. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 400 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch, PID and transcript-directory defaults, `--repo` reaching arming on every entry point, the batch-id pattern over an `R`-prefixed plan, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, every dedup path, and one banner being one `poll.log` line. Touches neither the real repo nor the real transcript directory, and never runs the real `gh` or the real `pgrep`. |
+| `selftest.sh` | 411 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch, PID and transcript-directory defaults, `--repo` reaching arming on every entry point, the batch-id pattern over an `R`-prefixed plan, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, every dedup path, one banner being one `poll.log` line, and the watcher's own session kept out of the PID set. Touches neither the real repo nor the real transcript directory, and never runs the real `gh` or the real `pgrep`. |
 
 ## What you have to pass, and what you do not
 
@@ -32,7 +32,7 @@ Four things are **derived**, so the only flags a normal invocation needs are
 | | derived from | pass it only when |
 |---|---|---|
 | the branch | `git symbolic-ref --short HEAD` in the watched repo, read **once at arming** | you want to watch a branch the repo is not on — which is also what arms the wrong-branch tripwire |
-| the builder PID set | the `claude --dangerous…` processes alive **at arming** whose working directory is inside the watched repo, via `pgrep` | you know which processes are the builder's and the derived set is wrong |
+| the builder PID set | the `claude --dangerous…` processes alive **at arming** whose working directory is inside the watched repo, via `pgrep` — less the watcher's own session (the process tree of the shell running `arming.sh`), which arming counts out loud | you know which processes are the builder's and the derived set is wrong |
 | the transcript directory | Claude Code's project directory for the watched repo — its absolute path with every non-alphanumeric character replaced by `-` | Claude Code's encoding changes, or the sessions are under another path; then `SPANWEAVE_TDIR=<dir>` |
 | the builder transcript | the derivation rule in `WATCH.md` — prompt, run number, not-an-aux-session, **and last written no earlier than the base commit**; failing the run number, the one post-base non-aux transcript about the plan, if there is exactly one | the derivation cannot see your session, or two post-base sessions could be it; then `SPANWEAVE_PINNED=<uuid>.jsonl` |
 

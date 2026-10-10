@@ -128,7 +128,78 @@ def pid_cwd(pid):
         return None
 
 
-def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None):
+def proc_ppids():
+    """{pid: ppid} for every process this user can see in /proc, read once.
+
+    A process that exits mid-scan, or whose stat cannot be read, is simply
+    absent - the map is used to find a tree, and a missing branch of it only
+    means less is excluded, never that a stranger is."""
+    out = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name) as fh:
+                stat = fh.read()
+            # comm is in parentheses and may itself hold spaces or ')', so the
+            # fields are counted from the LAST ')'.
+            out[int(name)] = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def session_tree(shell_pid, ppids=None):
+    """-> set: `shell_pid`, every ancestor of it, and every descendant of it.
+
+    This is the watcher's own session, seen from the shell running arming.sh.
+    A watch armed from a Claude Code session - the Monitor path - is a child of
+    that session's `claude` process, and when that session was started with
+    `--dangerously-skip-permissions` inside the watched repo it is
+    builder-shaped and in scope: until 2026-10-10 arming put the watcher in its
+    own PID set, so `builder gone` was armed on the watcher and its signal about
+    the builder was diluted by a process that outlives every poll.  Ancestors
+    are the case that happens; descendants are included because nothing the
+    shell spawned is a builder either."""
+    ppids = proc_ppids() if ppids is None else ppids
+    if not shell_pid:
+        return set()
+    tree = {shell_pid}
+    pid, seen = shell_pid, set()
+    while pid in ppids and pid not in seen and pid > 1:
+        seen.add(pid)
+        pid = ppids[pid]
+        if pid > 0:
+            tree.add(pid)
+    children = {}
+    for child, parent in ppids.items():
+        children.setdefault(parent, []).append(child)
+    stack = [shell_pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in tree:
+                tree.add(child)
+                stack.append(child)
+    return tree
+
+
+def builder_pids(pgrep_out):
+    """The builder-shaped PIDs in a `pgrep -a`-style listing, in its order."""
+    pids = []
+    for line in pgrep_out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() \
+                and parts[1].startswith(ARM_CMD_PREFIX):
+            pids.append(int(parts[0]))
+    return pids
+
+
+def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None,
+                 exclude=()):
     """-> (armed, outside): the builder-shaped `claude` PIDs whose working
     directory is inside `repo` or inside one of `also`, and the rest.
 
@@ -154,7 +225,10 @@ def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None):
     armed on - that is the pre-repo behaviour, kept for a direct caller.  A PID
     whose cwd cannot be read is reported as outside, never armed on: "not known
     to be this repo's" is the honest reading, and the caller says so out loud
-    rather than quietly arming a trigger on a process it could not identify."""
+    rather than quietly arming a trigger on a process it could not identify.
+
+    A PID in `exclude` - the watcher's own session, see `session_tree` - is in
+    neither list: it is not a builder, inside the scope or out of it."""
     out = claude_processes() if pgrep_out is None else pgrep_out
     root = os.path.realpath(os.path.abspath(os.path.expanduser(repo))) if repo else None
     roots = [root] if root else []
@@ -165,12 +239,9 @@ def pids_in_repo(pgrep_out=None, repo=None, cwd_of=pid_cwd, also=None):
         if r not in roots:
             roots.append(r)
     armed, outside = [], []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2 or not parts[0].isdigit() \
-                or not parts[1].startswith(ARM_CMD_PREFIX):
+    for pid in builder_pids(out):
+        if pid in exclude:
             continue
-        pid = int(parts[0])
         if root is None:
             armed.append(pid)
             continue
