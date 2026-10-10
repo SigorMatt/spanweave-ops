@@ -183,8 +183,12 @@ brackets every event:
 >>> LINE RESUMED after stall (quiet 51.0 min): HEAD a9f6fd9 -> 7f68aca
 ```
 
-`watch_monitor.sh` streams exactly those to stdout and everything else to
-`state/poll.log`. `watch_loop.sh` prints everything to the terminal.
+`watch_monitor.sh` streams exactly those to stdout. `state/poll.log` has one
+writer, `watch_run.sh`, which appends each banner and each event to it once,
+whichever front end ran it; the monitor keeps the last invocation's full output
+(stderr too) in `state/last_invocation.txt` for its error tails. Until
+2026-10-10 the monitor also teed everything into `poll.log`, so every banner
+under it was logged twice. `watch_loop.sh` prints everything to the terminal.
 
 ## Exit codes
 
@@ -819,12 +823,15 @@ commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl to overrid
   `fired_at`). `last_seen_head` is only consulted when no `--base` is given;
   pass `--base` to re-baseline, or delete the file to clear the dedup lists
   too.
-- `poll.log` — one banner line per poll, plus the full text of every event.
+- `poll.log` — one banner line per poll, plus the full text of every event,
+  each written once, by `watch_run.sh`.
+- `last_invocation.txt` — `watch_monitor.sh` only: the last `watch_run.sh`
+  invocation's full output, overwritten each time.
 - `last_evidence.txt` — the most recent evidence block.
 
 ## Verified
 
-`./selftest.sh` — 339 cases, fixtures only, `~/git/spanweave` and the real
+`./selftest.sh` — 400 cases, fixtures only, `~/git/spanweave` and the real
 transcript directory never touched — and, since 2026-10-04, the real `pgrep`
 not run either: arming now says which builder-shaped processes its repo scope
 refused, so a case that read the machine put this machine's live sessions into

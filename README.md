@@ -16,12 +16,12 @@ behaviour contract; this file is how to run it.
 | file | what it does |
 |---|---|
 | `watch_run.sh` | One watch invocation: polls every 5 min for at most 9 min, evaluates the five triggers, prints events. The whole policy lives here. |
-| `watch_monitor.sh` | Arming path under the **Monitor** tool. Re-invokes `watch_run.sh` forever; forwards only event blocks to stdout, banners to `state/poll.log`, plus an hourly `HEARTBEAT`. Stops on a terminal trigger. |
+| `watch_monitor.sh` | Arming path under the **Monitor** tool. Re-invokes `watch_run.sh` forever; forwards only event blocks to stdout, plus an hourly `HEARTBEAT`; it never writes `state/poll.log`, which `watch_run.sh` alone appends to, once per banner and once per event. Stops on a terminal trigger. |
 | `watch_loop.sh` | Arming path in a **plain terminal**. Re-invokes `watch_run.sh` forever, everything to the terminal. Stops on a terminal trigger. |
 | `status_check.sh` | One-shot status report. Writes nothing anywhere. |
 | `arming.sh` | Sourced by all four. Resolves, **once**, the two facts that must be fixed when a watch is armed rather than re-read per poll: the branch and the builder PID set — both read from the watched repo, which is why it also pulls `--repo` out of argv for the two looping front ends. |
 | `watch_lib.py` | Shared read-only helpers — the transcript-derivation rule, the tripwire's batch-declaration rule, `WORKPLAN.md` parsing, transcript tails. Both entry points import it, so each rule has one implementation. |
-| `selftest.sh` | 339 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch, PID and transcript-directory defaults, `--repo` reaching arming on every entry point, the batch-id pattern over an `R`-prefixed plan, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, and every dedup path. Touches neither the real repo nor the real transcript directory, and never runs the real `gh` or the real `pgrep`. |
+| `selftest.sh` | 400 cases over throwaway fixtures. Proves both rules, the floor read backwards and forwards, the derived branch, PID and transcript-directory defaults, `--repo` reaching arming on every entry point, the batch-id pattern over an `R`-prefixed plan, the verdict vocabulary — including both underway branches and both finished qualifiers — all four CI answers behind `finished`, the series close and the absence that is not one, every dedup path, and one banner being one `poll.log` line. Touches neither the real repo nor the real transcript directory, and never runs the real `gh` or the real `pgrep`. |
 
 ## What you have to pass, and what you do not
 

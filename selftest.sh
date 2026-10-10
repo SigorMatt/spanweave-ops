@@ -691,6 +691,11 @@ grep -q "not a substitute" "$TMP/last_run.txt" \
 
 # The arming front end has to know the new code too, or a red CI reads as
 # "unexpected exit" - a stop, but one that says the watcher broke.
+# poll.log has one writer, watch_run.sh: the monitor used to tee its output in
+# as well, so every banner, and every event, landed in the log twice.  Counted
+# as a delta, because ST2's log already holds the polls above.
+pl_banners0="$(grep -c '^poll ' "$ST2/poll.log")"
+pl_events0="$(grep -c "^>>> EVENT finished: CI red on $TIP7\$" "$ST2/poll.log")"
 mout="$(SPANWEAVE_STATE_DIR="$ST2" SPANWEAVE_REPO="$R2" SPANWEAVE_TDIR="$TD2" \
         SPANWEAVE_PINNED="11111111.jsonl" SPANWEAVE_SELF="none.jsonl" \
         SPANWEAVE_BASE="$BASE2" SPANWEAVE_BRANCH=audit-fixes \
@@ -700,6 +705,21 @@ check "watch_monitor.sh stops on CI red with its own exit code" "$?" "15"
 printf '%s\n' "$mout" | grep -q "TERMINAL exit=15" \
   && ok "watch_monitor.sh names CI red as terminal, not unexpected" \
   || bad "watch_monitor.sh reports CI red as an unexpected exit"
+check "one watch_monitor.sh banner is one poll.log line, not two" \
+      "$(( $(grep -c '^poll ' "$ST2/poll.log") - pl_banners0 ))" "1"
+check "its event reaches poll.log once" \
+      "$(( $(grep -c "^>>> EVENT finished: CI red on $TIP7\$" "$ST2/poll.log") - pl_events0 ))" "1"
+check "the monitor's banner count equals the polls watch_run.sh printed" \
+      "$(grep -c '^poll ' "$ST2/last_invocation.txt")" "1"
+# And with no front end at all: watch_run.sh alone still logs its banner, since
+# the monitor's tee was the only path some events had into the log before.
+pl_banners0="$(grep -c '^poll ' "$ST2/poll.log")"
+run2 >/dev/null
+check "one watch_run.sh --once banner is one poll.log line" \
+      "$(( $(grep -c '^poll ' "$ST2/poll.log") - pl_banners0 ))" "1"
+check "and it is the banner the poll printed" \
+      "$(tail -n +1 "$ST2/poll.log" | grep '^poll ' | tail -1)" \
+      "$(grep -m1 '^poll ' "$TMP/last_run.txt")"
 
 gh_unavailable "could not connect to api.github.com"
 out="$(run2)"

@@ -758,13 +758,24 @@ def main():
 
 
 def emit(kind, text):
-    """Print an event so a front end can forward it verbatim."""
+    """Print an event so a front end can forward it verbatim, and log it.
+
+    This script is poll.log's only writer - the banner above, and every event
+    here - so each reaches the log exactly once whichever front end ran it.
+    `watch_monitor.sh` used to tee this script's whole output into the log as
+    well, and every banner landed in it twice.
+    """
     if "\n" in text:
-        print(">>> EVENT %s" % kind, flush=True)
-        print(text, flush=True)
-        print("<<< END EVENT", flush=True)
+        lines = [">>> EVENT %s" % kind, text, "<<< END EVENT"]
     else:
-        print(">>> LINE %s" % text, flush=True)
+        lines = [">>> LINE %s" % text]
+    for line in lines:
+        print(line, flush=True)
+    try:
+        with open(LOG, "a") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
 
 
 try:

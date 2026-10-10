@@ -2,7 +2,9 @@
 # watch_monitor.sh - event-stream front end for watch_run.sh, for the Monitor tool.
 #
 # stdout is the event stream and is kept deliberately quiet: per-poll banners go
-# to state/poll.log only.  A line reaches stdout in exactly these cases:
+# to state/poll.log only - written there by watch_run.sh, which is the log's one
+# writer, so this script never appends to it.  A line reaches stdout in exactly
+# these cases:
 #
 #   the body of a `>>> EVENT <kind>` ... `<<< END EVENT` block, or a
 #   `>>> LINE <text>` one-liner, emitted by watch_run.sh - that is every
@@ -47,10 +49,14 @@ HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-6}"    # invocations (~9 min each) between h
 
 n=0
 while :; do
-  # Everything watch_run.sh prints is appended to poll.log; only event blocks
-  # are echoed to this script's stdout.
-  "$HERE/watch_run.sh" "$@" 2>&1 | awk -v logf="$STATE/poll.log" '
-    { print >> logf; fflush(logf) }
+  # Only event blocks are echoed to this script's stdout.  poll.log is not
+  # written here: watch_run.sh already appends every banner and every event to
+  # it, and teeing its output in as well put each banner in the log twice.  The
+  # invocation's full output - stderr included, which watch_run.sh never logs -
+  # is kept in last_invocation.txt, overwritten each time, for the error tails.
+  : > "$STATE/last_invocation.txt"
+  "$HERE/watch_run.sh" "$@" 2>&1 | awk -v outf="$STATE/last_invocation.txt" '
+    { print >> outf; fflush(outf) }
     /^>>> EVENT /  { inblk = 1; print substr($0, 11) ":"; fflush(); next }
     /^<<< END EVENT$/ { inblk = 0; print ""; fflush(); next }
     /^>>> LINE /   { print substr($0, 10); fflush(); next }
@@ -59,15 +65,16 @@ while :; do
   rc="${PIPESTATUS[0]}"
   case "$rc" in
     0)  ;;
-    2)  echo "WATCHER exit=2; last poll.log lines:"; tail -20 "$STATE/poll.log"; exit 2 ;;
+    2)  echo "WATCHER exit=2; last lines of its output:"
+        tail -20 "$STATE/last_invocation.txt"; exit 2 ;;
     # Which `finished` it was - plain, series closed, CI unverified - is on
     # the event line that has already streamed above this one, so this says
     # the code and does not re-guess the kind.
     10) echo "TERMINAL exit=10 (a finished form - see the event above)"; exit 10 ;;
     15) echo "TERMINAL exit=15 (finished: CI red on the pushed tip)"; exit 15 ;;
     13) echo "TERMINAL exit=13 (builder gone)"; exit 13 ;;
-    *)  echo "WATCHER unexpected exit=$rc; last poll.log lines:"
-        tail -20 "$STATE/poll.log"; exit "$rc" ;;
+    *)  echo "WATCHER unexpected exit=$rc; last lines of its output:"
+        tail -20 "$STATE/last_invocation.txt"; exit "$rc" ;;
   esac
   n=$(( n + 1 ))
   if [ $(( n % HEARTBEAT_EVERY )) -eq 0 ]; then
