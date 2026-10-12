@@ -504,6 +504,19 @@ encoding, rather than a guess shaped like one. With no such cwd stated — an
 operator who set `SPANWEAVE_TDIR` by hand — there is no extra root and the
 scope is the repo alone, as before.
 
+**What the widened rule cannot tell apart.** It scopes by working directory,
+and a directory is all it knows. When the builder and an auxiliary session
+(a reviewer, a watcher's Claude Code session) were both started in the same
+directory — as on 2026-10-12, both in `~/git/spanweave` — and both are
+builder-shaped, the rule accepts both: nothing in the cwd says which one is
+dispatching. What keeps the armed set right when **the aux arms** is the
+own-session exclusion (**The watcher's own session is never in it**, above):
+the aux's `claude` process is an ancestor of the arming shell, so it is counted
+out. Arm from **any other session** — a plain terminal, a third Claude Code
+session — and the aux is not in that shell's process tree, so it is armed on
+alongside the builder, and the aux exiting reads as `builder gone`. From
+another session, name the builder with `--pids` instead.
+
 `SPANWEAVE_PROJECTS` overrides the root the sweep walks, for the same two
 reasons `SPANWEAVE_TDIR` overrides the directory: an operator may know better,
 and `selftest.sh` must be able to keep its promise that it never reads the real

@@ -1554,7 +1554,7 @@ check "the status report reads it from the chosen transcript too" \
 echo
 echo "the memo tripwire counts declarations, not citations"
 # ---------------------------------------------------------------------------
-R4D="$TMP/repo4"; mkdir -p "$R4D"
+R4D="$TMP/repo4d"; mkdir -p "$R4D"
 git -C "$R4D" init -q -b audit-fixes
 git -C "$R4D" config user.email t@example.invalid
 git -C "$R4D" config user.name Selftest
@@ -1573,23 +1573,26 @@ cat > "$R4D/WORKPLAN.md" <<'MD'
 ---
 MD
 git -C "$R4D" add -A && git -C "$R4D" commit -qm "base"
-BASE4="$(git -C "$R4D" rev-parse HEAD)"
-git init -q --bare "$TMP/remote4.git"
-git -C "$R4D" remote add origin "$TMP/remote4.git"
+BASE4D="$(git -C "$R4D" rev-parse HEAD)"
+git init -q --bare "$TMP/remote4d.git"
+git -C "$R4D" remote add origin "$TMP/remote4d.git"
 git -C "$R4D" push -q origin audit-fixes
+check "the fixture is a fresh repo on audit-fixes, pushed at its base" \
+      "$(git -C "$R4D" symbolic-ref --short HEAD) $(git -C "$TMP/remote4d.git" rev-parse -q --verify audit-fixes)" \
+      "audit-fixes $BASE4D"
 
-TD4="$TMP/tdir4"; mkdir -p "$TD4"; ST4="$TMP/state4"; mkdir -p "$ST4"
-printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 3"}\n' > "$TD4/44444444.jsonl"
+TD4D="$TMP/tdir4d"; mkdir -p "$TD4D"; ST4D="$TMP/state4d"; mkdir -p "$ST4D"
+printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 3"}\n' > "$TD4D/44444444.jsonl"
 
-run4() {
+run4d() {
   local out rc
-  out="$(SPANWEAVE_STATE_DIR="$ST4" SPANWEAVE_REPO="$R4D" SPANWEAVE_TDIR="$TD4" \
+  out="$(SPANWEAVE_STATE_DIR="$ST4D" SPANWEAVE_REPO="$R4D" SPANWEAVE_TDIR="$TD4D" \
          SPANWEAVE_PINNED="44444444.jsonl" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
-         SPANWEAVE_BASE="$BASE4" SPANWEAVE_BRANCH=audit-fixes \
+         SPANWEAVE_BASE="$BASE4D" SPANWEAVE_BRANCH=audit-fixes \
          SPANWEAVE_PIDS="" SPANWEAVE_BATCHES="R1 R3" SPANWEAVE_MEMO="R3" \
          "$OPS_DIR/watch_run.sh" --once --run 3 2>&1)"
   rc=$?
-  printf '%s\n' "$out" > "$TMP/last_run4.txt"
+  printf '%s\n' "$out" > "$TMP/last_run4d.txt"
   printf '%s|%s' "$rc" \
     "$(printf '%s\n' "$out" | sed -n 's/^>>> EVENT \(.*\)$/\1/p' | paste -sd, -)"
 }
@@ -1602,7 +1605,7 @@ model: a timestamp keeps the digits the record wrote
 Batch R1 of WORKPLAN.md. R3 is the memo that will decide stated units; this
 commit does not pre-empt it, and F1 already settled the envelope question.
 MSG
-check "citing the memo batch while touching spanweave/ does not trip" "$(run4)" "0|"
+check "citing the memo batch while touching spanweave/ does not trip" "$(run4d)" "0|"
 
 echo y > "$R4D/spanweave/model.py"
 git -C "$R4D" add -A
@@ -1611,8 +1614,8 @@ model: implement the memo
 
 Batch R3 of WORKPLAN.md. This one really does touch the core.
 MSG
-check "declaring the memo batch while touching spanweave/ does trip" "$(run4)" "0|tripwire"
-grep -q "declaring memo-only batch(es) R3" "$TMP/last_run4.txt" \
+check "declaring the memo batch while touching spanweave/ does trip" "$(run4d)" "0|tripwire"
+grep -q "declaring memo-only batch(es) R3" "$TMP/last_run4d.txt" \
   && ok "the block names the declared memo batch" \
   || bad "the block does not name the declared memo batch"
 
