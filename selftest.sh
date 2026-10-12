@@ -3296,6 +3296,128 @@ printf '%s\n' "$none_out" | grep -q "^arming: excluded 0 builder-shaped" \
   && ok "a builder-shaped process outside the tree is counted as 0 excluded, out loud" \
   || bad "arming does not say it excluded 0: $none_out"
 
+# ---------------------------------------------------------------------------
+echo "the looping front ends export --run before arming"
+# ---------------------------------------------------------------------------
+# 2026-10-12, run 3 of the zoo series: armed from the Monitor path with
+# `--run 3`, the dispatching builder alive in another project's directory, and
+# the armed set came out empty.  The wide scope is asked of the derivation, the
+# derivation reads cfg["run"], and arming ran before `watch_run.sh` had parsed
+# `--run` - so it derived for DEF_RUN, found two transcripts clearing the floor
+# with neither naming that run, halted, and widened nothing.
+#
+# The fixture is that shape: a repo whose cwd is nobody's project, and under
+# the driver's project directory two post-base transcripts about the repo, one
+# naming run 3 (the builder) and one naming run 4.  For DEF_RUN neither is
+# named, so the floor sees two and halts; for run 3 the builder is chosen.
+R3="$TMP/repo-run"; mkdir -p "$R3"
+git -C "$R3" init -q -b zoo
+git -C "$R3" config user.email t@example.invalid
+git -C "$R3" config user.name Selftest
+cat > "$R3/WORKPLAN.md" <<'MD'
+## 1. Batches
+
+| # | Batch | Status | Est. calls |
+|---|---|---|---|
+| A5 | thing | todo | 20 |
+
+## 4. Resume note
+
+- run 3 opens.
+
+---
+MD
+git -C "$R3" add -A
+GIT_COMMITTER_DATE='2026-10-10 02:41:21' GIT_AUTHOR_DATE='2026-10-10 02:41:21' \
+  git -C "$R3" commit -qm "plan: run 3 of the zoo series"
+BASE3="$(git -C "$R3" rev-parse HEAD)"
+PROJ3="$TMP/projects-run"; mkdir -p "$PROJ3"
+DRIVER3="$TMP/driver-run"; mkdir -p "$DRIVER3"
+PD3="$PROJ3/$(printf '%s' "$DRIVER3" | sed 's/[^A-Za-z0-9]/-/g')"
+ZD3="$PROJ3/$(printf '%s' "$R3" | sed 's/[^A-Za-z0-9]/-/g')"
+mk "$PD3" run3b "$DRIVER3" "In $R3 on branch zoo: apply the decisions, then Execute WORKPLAN.md run 3" \
+   '2026-10-10 03:03:50' '2026-10-10 03:02:36'
+mk "$PD3" run4b "$DRIVER3" "Run 4 of the zoo series, in $R3: read WORKPLAN.md and apply it" \
+   '2026-10-10 03:00:00'
+check "the fixture's premise: for DEF_RUN the derivation halts on two" \
+      "$(SPANWEAVE_REPO="$R3" SPANWEAVE_PROJECTS="$PROJ3" SPANWEAVE_BASE="$BASE3" \
+         SPANWEAVE_TDIR="$ZD3" SPANWEAVE_BRANCH=zoo SPANWEAVE_PINNED="" SPANWEAVE_SELF="" \
+         CLAUDE_CODE_SESSION_ID="" env -u SPANWEAVE_RUN python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import DEF_RUN, config, derive_transcript_in
+assert str(DEF_RUN) != "3", "the case needs a run other than DEF_RUN"
+print(derive_transcript_in(config())[4])
+PY
+)" "none (two or more clear the floor)"
+
+# mon3 <state-dir> <monitor args...>: start the Monitor path in its own
+# session, with the builder stand-in named builder-shaped by the pgrep stub,
+# and wait for its first banner.  Echoes the monitor's PID (= its group).
+mon3() {
+  local st="$1"; shift
+  mkdir -p "$st"
+  env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS -u SPANWEAVE_RUN \
+      -u SPANWEAVE_BASE \
+      SPANWEAVE_STATE_DIR="$st" SPANWEAVE_PROJECTS="$PROJ3" SPANWEAVE_TDIR="$ZD3" \
+      SPANWEAVE_PINNED="" SPANWEAVE_SELF="" CLAUDE_CODE_SESSION_ID="" \
+      SPANWEAVE_BATCHES="A5" SPANWEAVE_MEMO="" POLL_SECONDS=1 \
+      PGREP_STUB_OUT="$BUILDER3 claude --dangerously-skip-permissions" \
+      setsid "$OPS_DIR/watch_monitor.sh" "$@" > "$st/out.txt" 2>&1 < /dev/null &
+  local m=$! i=0
+  while [ ! -s "$st/poll.log" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+  echo "$m"
+}
+
+# With --run 3: the builder's PID is armed on.  The banner says "no PID set"
+# exactly when the armed set is empty, and the stub names one builder-shaped
+# process, so a banner without it and an arming that does not call the builder
+# outside its scope is the set {builder}.  (Taking the builder away would not
+# prove more here: `builder gone` also wants a live transcript, and the
+# fixture's is days old by design.)
+( cd "$DRIVER3" && exec sleep 120 ) &
+BUILDER3=$!
+M3="$(mon3 "$TMP/st-run3" --repo "$R3" --run 3 --batches "A5" --base "$BASE3")"
+kill -- -"$M3" 2>/dev/null; wait "$M3" 2>/dev/null
+kill "$BUILDER3" 2>/dev/null; wait "$BUILDER3" 2>/dev/null
+check "the monitor armed with --run 3 polls run 3" \
+      "$(sed -n '1s/^poll [^|]*| \(run [0-9]*\) |.*/\1/p' "$TMP/st-run3/poll.log")" "run 3"
+grep -q "no PID set" "$TMP/st-run3/poll.log" \
+  && bad "armed with --run 3 the set is still empty: $(head -1 "$TMP/st-run3/poll.log")" \
+  || ok "... and arms on the dispatching builder: the banner has a PID set"
+grep -q "not armed on" "$TMP/st-run3/out.txt" \
+  && bad "arming still reports the builder as outside its scope: $(cat "$TMP/st-run3/out.txt")" \
+  || ok "... and arming does not call the builder outside its scope"
+
+# With --run absent: as before.  Arming derives for DEF_RUN, halts on two, and
+# says the builder is outside its scope; the watch then finds no transcript for
+# DEF_RUN and exits as a watcher error, which is what the operator sees today.
+( cd "$DRIVER3" && exec sleep 120 ) &
+BUILDER3=$!
+M3="$(mon3 "$TMP/st-norun" --repo "$R3" --batches "A5" --base "$BASE3")"
+# `mon3` ran in a command substitution, so the monitor is not this shell's
+# child and `wait` cannot read its status; its own exit line says it instead.
+i=0; while kill -0 "$M3" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+kill -- -"$M3" 2>/dev/null
+kill "$BUILDER3" 2>/dev/null; wait "$BUILDER3" 2>/dev/null
+grep -q "are running outside $R3 and are not armed on ($BUILDER3)" "$TMP/st-norun/out.txt" \
+  && ok "without --run the builder is outside the scope, as before, and arming says so" \
+  || bad "without --run arming did not behave as before: $(cat "$TMP/st-norun/out.txt")"
+grep -q "^WATCHER exit=2;" "$TMP/st-norun/out.txt" \
+  && ok "... and the watch stops as a watcher error" \
+  || bad "without --run the watch did not stop as a watcher error: $(cat "$TMP/st-norun/out.txt")"
+grep -q "no builder transcript found for run 2 " "$TMP/st-norun/out.txt" \
+  && ok "... about DEF_RUN, untouched" \
+  || bad "without --run the watch is not on DEF_RUN: $(cat "$TMP/st-norun/out.txt")"
+
+# watch_loop.sh arms through the same two lines; the order is what matters, so
+# it is read off the script rather than run (it has no event stream to stop).
+for fe in watch_monitor.sh watch_loop.sh; do
+  check "$fe exports --run before it arms" \
+        "$(grep -n '^spanweave_export_run "\$@"$\|^spanweave_arm$' "$OPS_DIR/$fe" | cut -d: -f2 | paste -sd, -)" \
+        'spanweave_export_run "$@",spanweave_arm'
+done
+
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
 exit "$fail"

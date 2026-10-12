@@ -35,9 +35,9 @@
 # the trigger on purpose).  An empty branch is treated as not-given, because
 # there is no branch by that name.
 
-# Every flag is passed through to `watch_run.sh` untouched, with one exception:
-# the two looping front ends pull `--base` out of their own argv and export it
-# before they arm.  Arming's liveness note is about a base, and arming happens
+# Every flag is passed through to `watch_run.sh` untouched, but the two looping
+# front ends also pull `--base`, `--run` and `--repo` out of their own argv and
+# export them before they arm.  Arming's liveness note is about a base, and arming happens
 # before `watch_run.sh` parses anything, so without this the note would be
 # computed against DEF_BASE - a previous run's start.  `watch_run.sh` and
 # `status_check.sh` parse `--base` themselves and do not need it.
@@ -48,6 +48,24 @@ spanweave_export_base() {
       # loop forever, so a flag given without a value is shifted one at a time.
       --base) [ -n "${2:-}" ] && export SPANWEAVE_BASE="$2"
               shift; [ $# -gt 0 ] && shift ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# `--run` is pulled out of argv the same way, and for a sharper reason than
+# the base: the dispatching-builder case below derives the transcript inside
+# arming, and the derivation reads cfg["run"].  Left to `watch_run.sh` to
+# parse, the run is still DEF_RUN when arming asks, so the derivation picks the
+# wrong run's builder - or, when two transcripts clear the floor and neither
+# names DEF_RUN, none at all - and the wide PID scope stays empty against a
+# builder that is alive and orchestrating.  `watch_run.sh` and
+# `status_check.sh` parse `--run` themselves before arming.
+spanweave_export_run() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run) [ -n "${2:-}" ] && export SPANWEAVE_RUN="$2"
+             shift; [ $# -gt 0 ] && shift ;;
       *) shift ;;
     esac
   done

@@ -18,10 +18,12 @@ export SPANWEAVE_OPS_DIR="$HERE"
 . "$HERE/arming.sh"
 # The repo out of argv, because arming reads the branch and the PID set FROM
 # the watched repo, and the base out of argv, so arming's liveness note is
-# about the base this watch is actually armed on: arming runs before
-# `watch_run.sh` ever sees these flags.
+# about the base this watch is actually armed on, and the run out of argv,
+# because the derivation that widens the PID scope reads it: arming runs
+# before `watch_run.sh` ever sees these flags.
 spanweave_export_repo "$@"
 spanweave_export_base "$@"
+spanweave_export_run "$@"
 spanweave_arm
 
 while :; do
