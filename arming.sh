@@ -88,6 +88,12 @@ spanweave_export_repo() {
   done
 }
 
+# Every note below is prefixed `arming:`, or `$SPANWEAVE_ARM_LABEL:` when the
+# caller sets it - `status_check.sh` sets `derivation`, because it derives the
+# same two values but arms no trigger on them, and a line saying `arming:` in a
+# one-shot report claimed a watch that does not exist.  Set it on the call
+# (`SPANWEAVE_ARM_LABEL=derivation spanweave_arm`), not exported, so it never
+# reaches a `watch_run.sh` that really does arm.
 spanweave_arm() {
   local need_branch=0 need_pids=0 out scope_note
   [ -z "${SPANWEAVE_BRANCH:-}" ] && need_branch=1
@@ -107,6 +113,7 @@ sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 import watch_lib
 
 repo = watch_lib.repo_dir()
+LABEL = os.environ.get("SPANWEAVE_ARM_LABEL") or "arming"
 # The dispatching-builder case: when the repo's own cwd is nobody's project
 # directory, the transcript is derived from another project's and the builder
 # driving this run has its cwd THERE, not in the repo.  Arming is the only
@@ -146,7 +153,7 @@ print(" ".join(str(p) for p in armed))
 # nothing builder-shaped running at all there is nothing to report, and arming
 # stays silent as it always has.
 if own or armed or outside:
-    print("arming: excluded %d builder-shaped claude process(es) as this watcher's"
+    print(LABEL + ": excluded %d builder-shaped claude process(es) as this watcher's"
           " own session (the process tree of shell %d)%s."
             % (len(own), shell, (": " + " ".join(str(p) for p in own)) if own else ""))
 # Line 4: the scope's rejections, so an empty armed set is never confused with
@@ -158,7 +165,7 @@ if outside:
     # repo and a note that said "outside <repo>" would be false about what was
     # armed on.
     scope = repo + "".join(" or %s" % a for a in also)
-    print("arming: %d builder-shaped claude process(es) are running outside %s"
+    print(LABEL + ": %d builder-shaped claude process(es) are running outside %s"
           " and are not armed on (%s); 'builder gone' watches only the %d"
           " inside it."
           % (len(outside), scope, " ".join(str(p) for p in outside), len(armed)))
@@ -208,6 +215,7 @@ sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
 import watch_lib
 
 cfg = watch_lib.config()
+LABEL = os.environ.get("SPANWEAVE_ARM_LABEL") or "arming"
 # Only against a base an operator actually named.  `watch_monitor.sh` and
 # `watch_loop.sh` arm before anything parses their flags, so without this the
 # note would be computed against DEF_BASE - a previous run's start - and a note
@@ -217,7 +225,7 @@ cfg = watch_lib.config()
 unknown, base_at, _rejected = (watch_lib.liveness_unknown_for_base(cfg)
                                if cfg["base_explicit"] else (False, None, []))
 if unknown:
-    print("arming: liveness is unknown for base %s (authored %s): every candidate"
+    print(LABEL + ": liveness is unknown for base %s (authored %s): every candidate"
           " transcript in %s was last written before it, so the stall rule runs on"
           " the commit and .git/index times alone. Pass SPANWEAVE_PINNED=<uuid>.jsonl"
           " to override."

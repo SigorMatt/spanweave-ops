@@ -41,9 +41,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# One-shot, so "armed once" and "armed now" are the same thing.
+# One-shot, so "armed once" and "armed now" are the same thing.  It arms
+# nothing that outlives this report, though - there is no trigger to arm - so
+# arming's notes are printed as `derivation:` lines here, not `arming:` ones.
 . "$OPS_DIR/arming.sh"
-spanweave_arm
+SPANWEAVE_ARM_LABEL=derivation spanweave_arm
 
 python3 - <<'PY'
 import os, sys, time
@@ -122,8 +124,16 @@ print("branch          : %s (watching %s, %s)"
       % (curbranch or "(detached)", BRANCH or "(none)", BRANCH_SRC))
 print("HEAD            : %s (%s)" % (headsha, headshort))
 if BRANCH:
-    print("origin/%-8s: %s%s" % (BRANCH, origin,
-                                 "" if origin != basefull else "  == base, not pushed"))
+    # origin at base is "not pushed" only while HEAD is past it.  When HEAD is
+    # the base too there is nothing to push, and the verdict line - which
+    # compares origin with HEAD - says "pushed"; this line must not contradict it.
+    if origin != basefull:
+        origin_note = ""
+    elif origin == headsha:
+        origin_note = "  == base (nothing beyond base to push)"
+    else:
+        origin_note = "  == base, not pushed"
+    print("origin/%-8s: %s%s" % (BRANCH, origin, origin_note))
 else:
     print("origin           : (no branch to compare against - the repo has a")
     print("                   detached HEAD and none was given with --branch)")

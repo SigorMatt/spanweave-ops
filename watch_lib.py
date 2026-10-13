@@ -420,7 +420,17 @@ def git_in(repo):
 # id, and the greedy `[a-z]?` means "R2a" is never read as a declaration of
 # "R2".  R2a and R2 are DIFFERENT BATCHES; conflating them would report R2's
 # shipped status for a row that has not run.
-BATCH_ID = r"[A-Z]\d+[a-z]?"
+#
+# A HYPHENATED SUFFIX is part of the id as well.  The zoo series' run 3 split
+# B7 into B7-Z3 and B7-Z5, and `[A-Z]\d+[a-z]?` read "| B7-Z3 |" as no row at
+# all (`\s*\|` cannot follow "B7" when "-Z3" does), so both rows were
+# "<row missing>"; and "Batch B7-Z3 of WORKPLAN.md" was no declaration, because
+# "B7" is not followed by whitespace and "of".  The subject form was worse:
+# "plan: B7-Z3 done" matched "B7" and the `\b` before "-" held, so it declared
+# B7 - a batch it is not.  The second part is a capital letter and digits, no
+# letter suffix of its own; the group is optional and greedy, so a plain "B7"
+# reads exactly as before and "B7-Z3" is never read as "B7".
+BATCH_ID = r"[A-Z]\d+[a-z]?(?:-[A-Z]\d+)?"
 DECL_BODY_RE = re.compile(r"^\s*Batch\s+(%s)\s+of\s+WORKPLAN\.md\b" % BATCH_ID,
                           re.I | re.M)
 DECL_SUBJ_RE = re.compile(r"^\s*plan:\s*(%s)\b" % BATCH_ID, re.I)
@@ -430,19 +440,21 @@ DECL_SUBJ_RE = re.compile(r"^\s*plan:\s*(%s)\b" % BATCH_ID, re.I)
 # was all letters-and-digits; it is wrong now, because it folds "R2a" to "R2A",
 # which matches no row and reads as a fourth batch.  The letter and digits go
 # up, the suffix goes down.
-_CANON_RE = re.compile(r"^([A-Za-z])(\d+)([A-Za-z]?)$")
+# A hyphenated second part has no suffix of its own, so it is lifted whole.
+_CANON_RE = re.compile(r"^([A-Za-z])(\d+)([A-Za-z]?)(-[A-Za-z]\d+)?$")
 
 
 def canon_batch_id(batch_id):
-    """`R2a`, however it was spelled.  An id that is not batch-shaped is
-    upper-cased and handed back unchanged otherwise - this is a normaliser, not
-    a validator, and the regexes above are what decide what an id is."""
+    """`R2a` or `B7-Z3`, however it was spelled.  An id that is not
+    batch-shaped is upper-cased and handed back unchanged otherwise - this is a
+    normaliser, not a validator, and the regexes above are what decide what an
+    id is."""
     text = (batch_id or "").strip()
     m = _CANON_RE.match(text)
     if not m:
         return text.upper()
-    letter, digits, suffix = m.groups()
-    return letter.upper() + digits + suffix.lower()
+    letter, digits, suffix, part = m.groups()
+    return letter.upper() + digits + suffix.lower() + (part or "").upper()
 
 
 def declared_batches(subject, body):

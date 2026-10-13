@@ -109,6 +109,17 @@ Whenever anything builder-shaped is running, arming says how many it excluded,
 watcher's own session (the process tree of shell S): P …`. With nothing
 builder-shaped running it stays silent, as before.
 
+**`status_check.sh` derives; it does not arm.** It sources `arming.sh` for
+the same two values, but a one-shot report holds no trigger on either, so a
+line that said `arming:` there claimed a watch that does not exist. On that
+path every one of arming's notes — the exclusion count, the scope's
+rejections, the liveness note — is printed with the prefix `derivation:`
+instead (`SPANWEAVE_ARM_LABEL=derivation spanweave_arm`, set on the call, never
+exported). They are relabelled rather than suppressed: the scope's rejections
+are exactly what an operator reading a status report needs to see, and
+dropping them would make an empty PID set read as *no builder is running*
+again. Every path that really arms still says `arming:`.
+
 `watch_monitor.sh` and `watch_loop.sh` re-invoke `watch_run.sh` every few
 minutes, so **they** arm, at their own start, and export both down; a
 `watch_run.sh` started directly arms for itself. Whoever arms first owns both
@@ -728,6 +739,16 @@ folding them together would report `R2`'s shipped status for a row that has not
 run. The fold to one spelling is `canon_batch_id`, not `.upper()`: upper-casing
 turned `R2a` into `R2A`, which matches no row and reads as a fourth batch, so
 the letter and digits go up and the suffix goes down.
+
+*A hyphenated suffix is part of the id.* Run 3 of the zoo series split `B7`
+into `B7-Z3` and `B7-Z5`, and `[A-Z]\d+[a-z]?` read both rows as `<row
+missing>` (`\s*\|` cannot follow `B7` when `-Z3` does) and both `Batch B7-Z3 of
+WORKPLAN.md` body lines as no declaration. The subject form was worse: `plan:
+B7-Z3 done` matched `B7`, the `\b` before `-` held, and the commit declared a
+batch it is not. The pattern is `[A-Z]\d+[a-z]?(?:-[A-Z]\d+)?` now; the
+hyphenated part is a capital letter and digits with no suffix of its own, and
+`canon_batch_id` lifts it whole. The group is optional and greedy, so `B7` alone
+reads exactly as before and `B7-Z3` is never read as `B7`.
 
 *Row statuses are prefix-matched.* `is_stopped` tested `done` and `dropped` by
 equality while `awaiting` and `blocked` were prefix-matched. The plan does not

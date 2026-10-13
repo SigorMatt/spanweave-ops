@@ -2192,7 +2192,8 @@ def c(name, got, want):
         bad = 1
 
 
-c("the pattern itself admits R and a digit", BATCH_ID, r"[A-Z]\d+[a-z]?")
+c("the pattern itself admits R and a digit", BATCH_ID,
+  r"[A-Z]\d+[a-z]?(?:-[A-Z]\d+)?")
 # The receiver series' own plan commits, verbatim.
 c("a plan: subject declares an R batch",
   declared_batches("plan: R0 done, and the pins are HTTPS so CI can check out"
@@ -2278,7 +2279,8 @@ def c(name, got, want):
 
 
 # --- the pattern, directly.
-c("the pattern admits a single lower-case suffix", BATCH_ID, r"[A-Z]\d+[a-z]?")
+c("the pattern admits a single lower-case suffix", BATCH_ID,
+  r"[A-Z]\d+[a-z]?(?:-[A-Z]\d+)?")
 
 # --- subjects.  These are the receiver series' own plan subjects, verbatim.
 c("a plan: subject declares R2a",
@@ -2349,6 +2351,101 @@ c("the raw line for R2a is R2a's line, not R2's",
 c("awaiting PR #4 is a stopped status", is_stopped(statuses["R2c"]), True)
 c("no batch is todo once the suffixed rows are visible",
   first_todo(statuses, ["R2", "R2a", "R2b", "R2c", "R3"]), None)
+sys.exit(bad)
+PY
+[ $? -eq 0 ] || fail=1
+
+# ---------------------------------------------------------------------------
+echo
+echo "a hyphenated suffix is part of the batch id: B7-Z3 is not B7"
+# ---------------------------------------------------------------------------
+# 2026-10-13, run 3 of the zoo series: B7 was split into B7-Z3 and B7-Z5, and
+# `[A-Z]\d+[a-z]?` read both rows as "<row missing>" - "| B7-Z3 |" has "-Z3"
+# where the pattern wanted `\s*\|` - and both "Batch B7-Z3 of WORKPLAN.md"
+# body lines as no declaration.  Worse, "plan: B7-Z3 done" declared B7: the
+# `\b` between "7" and "-" holds.  The pattern is
+# `[A-Z]\d+[a-z]?(?:-[A-Z]\d+)?` now.  As in the section above, every case
+# asserts the WHOLE list, because a spurious "B7" is exactly the failure.
+RHY="$TMP/repoHyphen"; mkdir -p "$RHY"
+cat > "$RHY/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| ID | Batch | Status | Calls |
+|---|---|---|---|
+| B7 | the zoo's first enclosure | done (`1a2b3c4`) | 12 |
+| B7-Z3 | the third enclosure, split out | done (`5d6e7f8`) | 6 |
+| B7-Z5 | the fifth enclosure, split out | todo | 7 |
+| B8 | the gate | todo | 4 |
+
+## 4. Resume note
+
+- B7-Z3 done.
+
+---
+MD
+python3 - "$RHY" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPANWEAVE_OPS_DIR"])
+from watch_lib import (canon_batch_id, declared_batches, first_todo,
+                       workplan_statuses)
+
+bad = 0
+
+
+def c(name, got, want):
+    global bad
+    if got == want:
+        print("  PASS  %s" % name)
+    else:
+        print("  FAIL  %s\n        got %r\n        want %r" % (name, got, want))
+        bad = 1
+
+
+# --- WORKPLAN.md section 1.
+statuses, raw, source = workplan_statuses(sys.argv[1])
+c("hyphenated rows are read, not reported missing",
+  (source, statuses),
+  ("worktree", {"B7": "done (`1a2b3c4`)", "B7-Z3": "done (`5d6e7f8`)",
+                "B7-Z5": "todo", "B8": "todo"}))
+c("the hyphenated rows carry their OWN status, not B7's",
+  [statuses.get("B7-Z3"), statuses.get("B7-Z5")], ["done (`5d6e7f8`)", "todo"])
+c("the raw line for B7-Z5 is B7-Z5's line",
+  raw["B7-Z5"].split("|")[2].strip(), "the fifth enclosure, split out")
+c("the first todo is B7-Z5, read from its row",
+  first_todo(statuses, ["B7", "B7-Z3", "B7-Z5", "B8"]), "B7-Z5")
+
+# --- commit bodies.
+c("a body line declares B7-Z3",
+  declared_batches("zoo: the third enclosure", "Batch B7-Z3 of WORKPLAN.md."),
+  ["B7-Z3"])
+c("a body line declares B7-Z5 and nothing more",
+  declared_batches("zoo: the fifth enclosure",
+                   "Batch B7-Z5 of WORKPLAN.md.  It follows B7-Z3."),
+  ["B7-Z5"])
+c("a lower-case body line folds to the canonical id",
+  declared_batches("x: y", "batch b7-z3 of WORKPLAN.md."), ["B7-Z3"])
+
+# --- subjects: the one that used to declare the wrong batch.
+c("a plan: subject declaring B7-Z3 does NOT declare B7",
+  declared_batches("plan: B7-Z3 done", ""), ["B7-Z3"])
+
+# --- B7 alone, exactly as before.
+c("B7 alone still declares B7 in a body line",
+  declared_batches("zoo: the first enclosure", "Batch B7 of WORKPLAN.md."),
+  ["B7"])
+c("B7 alone still declares B7 in a subject",
+  declared_batches("plan: B7 done", ""), ["B7"])
+c("B7 followed by a hyphenated word is still B7",
+  declared_batches("plan: B7 done - B7-Z3 is next", ""), ["B7"])
+c("B7 and B7-Z3 are two batches, not one declared twice",
+  declared_batches("plan: B7 done", "Batch B7-Z3 of WORKPLAN.md."),
+  ["B7", "B7-Z3"])
+
+# --- the fold.
+c("canon leaves a hyphenated id alone", canon_batch_id("B7-Z3"), "B7-Z3")
+c("canon lifts both parts", canon_batch_id("b7-z3"), "B7-Z3")
+c("canon keeps a letter suffix lower before the hyphen",
+  canon_batch_id("R2A-z1"), "R2a-Z1")
 sys.exit(bad)
 PY
 [ $? -eq 0 ] || fail=1
@@ -3420,6 +3517,87 @@ for fe in watch_monitor.sh watch_loop.sh; do
         "$(grep -n '^spanweave_export_run "\$@"$\|^spanweave_arm$' "$OPS_DIR/$fe" | cut -d: -f2 | paste -sd, -)" \
         'spanweave_export_run "$@",spanweave_arm'
 done
+
+# ---------------------------------------------------------------------------
+echo
+echo "status_check: origin at base is 'not pushed' only while HEAD is past it"
+# ---------------------------------------------------------------------------
+# 2026-10-13, run 3 of the zoo series: origin/zoo equalled both HEAD and base,
+# the repo section said "== base, not pushed" and the verdict line, which
+# compares origin with HEAD, said "pushed".  Both were about the same refs.
+# Nothing beyond base is nothing to push, and the repo section now says so.
+RNP="$TMP/repoNotPushed"; mkdir -p "$RNP"
+git -C "$RNP" init -q -b zoo
+git -C "$RNP" config user.email t@example.invalid
+git -C "$RNP" config user.name Selftest
+cat > "$RNP/WORKPLAN.md" <<'MD'
+## 1. Batch list
+
+| ID | Batch | Status | Calls |
+|---|---|---|---|
+| B7-Z3 | the third enclosure | todo | 6 |
+
+## 4. Resume note
+
+- nothing yet.
+
+---
+MD
+git -C "$RNP" add -A && git -C "$RNP" commit -qm "base"
+BASENP="$(git -C "$RNP" rev-parse HEAD)"
+git init -q --bare "$TMP/remoteNP.git"
+git -C "$RNP" remote add origin "$TMP/remoteNP.git"
+git -C "$RNP" push -q origin zoo
+TDNP="$TMP/tdirNP"; mkdir -p "$TDNP"
+printf '{"type":"last-prompt","lastPrompt":"Execute WORKPLAN.md run 3"}\n' > "$TDNP/dddddddd.jsonl"
+scNP() {  # scNP [PGREP_STUB_OUT] -> the status report over this fixture, arming derived
+  env -u SPANWEAVE_PIDS -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC \
+      SPANWEAVE_REPO="$RNP" SPANWEAVE_TDIR="$TDNP" \
+      SPANWEAVE_PINNED="dddddddd.jsonl" SPANWEAVE_SELF="none.jsonl" \
+      PGREP_STUB_OUT="${1:-}" \
+      "$OPS_DIR/status_check.sh" --run 3 --batches "B7-Z3" --base "$BASENP" 2>&1
+}
+gh_unavailable
+out="$(scNP)"
+check "origin == HEAD == base: nothing beyond base to push" \
+      "$(printf '%s\n' "$out" | sed -n 's/^origin\/zoo *: [0-9a-f]*//p')" \
+      "  == base (nothing beyond base to push)"
+printf '%s\n' "$out" | grep -q "^  head      : [0-9a-f]* pushed |" \
+  && ok "... and the verdict section's 'pushed' agrees with it" \
+  || bad "the verdict section does not say pushed: $(printf '%s\n' "$out" | grep '^  head ')"
+check "the hyphenated row is read in the report, not '<row missing>'" \
+      "$(printf '%s\n' "$out" | grep -c '<row missing>')" "0"
+
+git -C "$RNP" commit -q --allow-empty -m "zoo: past base, not pushed"
+check "origin == base, HEAD past it: still 'not pushed'" \
+      "$(printf '%s\n' "$(scNP)" | sed -n 's/^origin\/zoo *: [0-9a-f]*//p')" \
+      "  == base, not pushed"
+
+# ---------------------------------------------------------------------------
+echo
+echo "status_check arms nothing, so arming's notes are derivation: lines there"
+# ---------------------------------------------------------------------------
+# status_check.sh sources arming.sh for the branch and the PID set, and printed
+# its notes as "arming: ..." although no trigger is armed by a one-shot report.
+# The same notes are prefixed "derivation:" on that path; arming itself, and
+# every entry point that really arms, still says "arming:".
+out="$(scNP "4000004 claude --dangerously-skip-permissions")"
+printf '%s\n' "$out" | grep -q "^derivation: 1 builder-shaped claude process(es) are running outside $RNP" \
+  && ok "status_check prints the scope note as a derivation: line" \
+  || bad "status_check does not print a derivation: scope note: $out"
+printf '%s\n' "$out" | grep -q "^derivation: excluded 0 builder-shaped" \
+  && ok "... and the exclusion note too" \
+  || bad "status_check does not print a derivation: exclusion note: $out"
+check "status_check prints no arming: line" \
+      "$(printf '%s\n' "$out" | grep -c '^arming:')" "0"
+check "the label is not left behind for a later arming" \
+      "$(env -u SPANWEAVE_BRANCH -u SPANWEAVE_BRANCH_SRC -u SPANWEAVE_PIDS \
+           SPANWEAVE_REPO="$RNP" PGREP_STUB_OUT="4000004 claude --dangerously-skip-permissions" \
+           bash -c '. "$SPANWEAVE_OPS_DIR/arming.sh"
+                    SPANWEAVE_ARM_LABEL=derivation spanweave_arm >/dev/null
+                    unset SPANWEAVE_BRANCH SPANWEAVE_BRANCH_SRC SPANWEAVE_PIDS
+                    spanweave_arm' | cut -d: -f1 | sort -u | paste -sd, -)" \
+      "arming"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "selftest: all cases pass"; else echo "selftest: FAILURES above"; fi
